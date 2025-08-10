@@ -1,123 +1,98 @@
-import cv2
-import numpy as np
+import cv2, numpy as np, time, queue, threading, os
+from collections import deque
 from openvino.runtime import Core
-import os
-import time
 
-# ===== Settings =====
+VIDEO_PATH = os.path.join(os.path.dirname(__file__), "test", "test_video_6.mp4")
+MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentation-adas-0001.xml"
+NUM_REQS = 3          # try 2 or 3
 WRITE_OUTPUT = True
-MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentation-adas-0001.xml"  # fastest
-VIDEO_PATH = os.path.join(os.path.dirname(__file__), "test", "test_video_4.mp4")
-NUM_THREADS = os.cpu_count() or 8    # use whatever Docker/WSL exposes
 
-# ===== OpenVINO: load & compile =====
+# ---- OpenVINO setup ----
 core = Core()
 model = core.read_model(MODEL_PATH)
-compiled_model = core.compile_model(
-    model,
-    "CPU",
-    {
-        "PERFORMANCE_HINT": "LATENCY",   # single-stream, best per-frame time
-        "NUM_STREAMS": "1",              # avoid oversubscription
-        "INFERENCE_NUM_THREADS": NUM_THREADS,
-    },
-)
-input_layer = compiled_model.input(0)
-output_layer = compiled_model.output(0)
-# model input is NCHW: [1,3,1024,2048]
-in_h, in_w = int(input_layer.shape[2]), int(input_layer.shape[3])
+compiled = core.compile_model(model, "CPU", {
+    "PERFORMANCE_HINT": "LATENCY",
+    "NUM_STREAMS": "1",
+    "INFERENCE_NUM_THREADS": os.cpu_count() or 8,
+})
+inp = compiled.input(0); outp = compiled.output(0)
+in_h, in_w = int(inp.shape[2]), int(inp.shape[3])
 
-# ===== Video IO =====
+# ---- Video IO ----
 cap = cv2.VideoCapture(VIDEO_PATH, cv2.CAP_FFMPEG)
 if not cap.isOpened():
-    raise RuntimeError(
-        f"Video exists={os.path.exists(VIDEO_PATH)} but cannot be opened. "
-        f"Ensure ffmpeg is installed in the image and using CAP_FFMPEG. Path: {VIDEO_PATH}"
-    )
+    raise RuntimeError(f"Cannot open {VIDEO_PATH} with FFmpeg backend.")
+fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+writer = cv2.VideoWriter("segmented_video.mp4", cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)) if WRITE_OUTPUT else None
 
-src_fps = cap.get(cv2.CAP_PROP_FPS)
-if not src_fps or np.isnan(src_fps) or src_fps <= 1e-3:
-    src_fps = 25.0  # sensible default
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-
-if WRITE_OUTPUT:
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter("segmented_video_1.mp4", fourcc, src_fps, (width, height))
-
-# ===== Colormap (256 safe) =====
+# ---- Color map ----
 np.random.seed(42)
 color_map = np.random.randint(0, 255, size=(256, 3), dtype=np.uint8)
 
-# ===== Warmup (helps JIT/thread pools) =====
-dummy = np.zeros((in_h, in_w, 3), dtype=np.uint8)
-dummy_blob = dummy.transpose(2, 0, 1)[None, ...]
-_ = compiled_model([dummy_blob])[output_layer]
+# ---- Postproc worker ----
+done_q = queue.Queue(maxsize=NUM_REQS * 2)
+STOP = object()
 
-# ===== Loop =====
-total_time = 0.0
+def postproc_worker():
+    while True:
+        item = done_q.get()
+        if item is STOP: break
+        frame_idx, frame_orig, result = item
+        seg_map = result.squeeze().astype(np.uint8)                # (1024,2048)
+        seg_overlay = color_map[seg_map]
+        seg_overlay_resized = cv2.resize(seg_overlay, (W, H), interpolation=cv2.INTER_NEAREST)
+        blended = cv2.addWeighted(frame_orig, 0.5, seg_overlay_resized, 0.5, 0)
+        if writer: writer.write(blended)
+
+post_thread = threading.Thread(target=postproc_worker, daemon=True)
+post_thread.start()
+
+# ---- Create N infer requests and per-slot userdata ----
+requests = [compiled.create_infer_request() for _ in range(NUM_REQS)]
+userdata  = [None] * NUM_REQS   # stores (frame_idx, frame_copy) for each slot
+
 frame_idx = 0
+start_all = time.time()
 
 while True:
-    frame_start = time.time()
-
-    # --- Read ---
-    t0 = time.time()
     ret, frame = cap.read()
-    t_read = time.time() - t0
-    if not ret:
-        break
+    if not ret: break
     frame_idx += 1
 
-    # --- Preprocess: resize exactly to model input (once) & NCHW uint8 ---
-    t0 = time.time()
+    # Prepare input (resize to model size, then NCHW uint8)
     if frame.shape[1] != in_w or frame.shape[0] != in_h:
         frame_resized = cv2.resize(frame, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
     else:
         frame_resized = frame
-    blob = frame_resized.transpose(2, 0, 1)[None, ...].astype(np.uint8)
-    t_pre = time.time() - t0
+    blob = frame_resized.transpose(2, 0, 1)[None].astype(np.uint8)
 
-    # --- Inference ---
-    t0 = time.time()
-    result = compiled_model([blob])[output_layer]
-    t_infer = time.time() - t0
+    slot = (frame_idx - 1) % NUM_REQS
+    req = requests[slot]
 
-    # --- Postprocess (labels -> colors, resize back to original) ---
-    t0 = time.time()
-    seg_map = result.squeeze().astype(np.uint8)        # (H,W) == (1024,2048)
-    seg_overlay = color_map[seg_map]                   # (H,W,3)
-    seg_overlay_resized = cv2.resize(seg_overlay, (width, height), interpolation=cv2.INTER_NEAREST)
-    t_post = time.time() - t0
+    # If this slot was used before, wait for it and dispatch its result to postproc
+    if userdata[slot] is not None:
+        req.wait()  # finish previous inference on this slot
+        result = req.get_output_tensor(outp.index).data[:]  # copy numpy
+        done_q.put((userdata[slot][0], userdata[slot][1], result))  # (idx, frame, result)
 
-    # --- Blend & write ---
-    t0 = time.time()
-    blended = cv2.addWeighted(frame, 0.5, seg_overlay_resized, 0.5, 0)
-    t_blend = time.time() - t0
+    # Start new async inference in this slot
+    userdata[slot] = (frame_idx, frame.copy())
+    req.start_async({inp: blob})
 
-    t0 = time.time()
-    if WRITE_OUTPUT:
-        out.write(blended)
-    t_write = time.time() - t0
+# Flush remaining in-flight requests
+for slot, req in enumerate(requests):
+    if userdata[slot] is not None:
+        req.wait()
+        result = req.get_output_tensor(outp.index).data[:]
+        done_q.put((userdata[slot][0], userdata[slot][1], result))
+        userdata[slot] = None
 
-    frame_time = time.time() - frame_start
-    total_time += frame_time
-
-    if frame_idx % 10 == 0 or frame_idx == 1:
-        fps_now = 1.0 / frame_time if frame_time > 0 else float("inf")
-        print(f"Frame {frame_idx}/{total_frames or '?'} - Total: {frame_time:.3f}s ({fps_now:.2f} FPS)")
-        print(f"    Read:   {t_read:.3f}s")
-        print(f"    Pre:    {t_pre:.3f}s   (resize+NCHW)")
-        print(f"    Infer:  {t_infer:.3f}s  <-- bottleneck")
-        print(f"    Post:   {t_post:.3f}s")
-        print(f"    Blend:  {t_blend:.3f}s")
-        print(f"    Write:  {t_write:.3f}s")
-
+# Stop worker & cleanup
+done_q.put(STOP)
+post_thread.join()
 cap.release()
-if WRITE_OUTPUT:
-    out.release()
+if writer: writer.release()
 
-avg_fps = frame_idx / total_time if total_time > 0 else 0.0
-print("✅ Processed video saved as segmented_video.mp4" if WRITE_OUTPUT else "✅ Finished (no output saved)")
-print(f"Average FPS: {avg_fps:.2f}")
+total_time = time.time() - start_all
+print(f"Done {frame_idx} frames in {total_time:.2f}s  →  {frame_idx/total_time:.2f} FPS (end-to-end)")
