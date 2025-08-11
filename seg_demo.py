@@ -52,7 +52,7 @@ class SegmentationModel:
         return results
 
 class SegmentationVideoProcessor:
-    def __init__(self, video_path, model_path, write_output=True, num_reqs=3):
+    def __init__(self, video_path, model_path, write_output=True, output_path = None, num_reqs=3):
         self.video_path = video_path
         self.model_path = model_path
         self.write_output = write_output
@@ -63,7 +63,7 @@ class SegmentationVideoProcessor:
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
         self.W = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.writer = cv2.VideoWriter("segmented_video.mp4", cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (self.W, self.H)) if write_output else None
+        self.writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (self.W, self.H)) if write_output else None
         np.random.seed(42)
         self.color_map = np.random.randint(0, 255, size=(256, 3), dtype=np.uint8)
         self.done_q = queue.Queue(maxsize=num_reqs * 2)
@@ -173,7 +173,8 @@ def main():
     MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentation-adas-0001.xml"
     NUM_REQS = 3
     WRITE_OUTPUT = True
-    processor = SegmentationVideoProcessor(VIDEO_PATH, MODEL_PATH, WRITE_OUTPUT, NUM_REQS)
+    OUTPUT_PATH = "test_results/segmented_video.mp4"
+    processor = SegmentationVideoProcessor(VIDEO_PATH, MODEL_PATH, WRITE_OUTPUT, NUM_REQS, output_path=OUTPUT_PATH)
     # Uncomment below to run socket server instead of video processing
     # processor.serve_socket(host='127.0.0.1', port=5000)
     processor.process()
