@@ -2,6 +2,7 @@ import cv2, numpy as np, time, queue, threading, os
 from openvino.runtime import Core
 import socket
 import struct
+import logging
 
 class SegmentationModel:
     def __init__(self, model_path, num_reqs=3):
@@ -52,7 +53,7 @@ class SegmentationModel:
         return results
 
 class SegmentationVideoProcessor:
-    def __init__(self, video_path, model_path, write_output=True, output_path = None, num_reqs=3):
+    def __init__(self, video_path, model_path, write_output=True, num_reqs=3, output_path = None):
         self.video_path = video_path
         self.model_path = model_path
         self.write_output = write_output
@@ -84,27 +85,49 @@ class SegmentationVideoProcessor:
             if self.writer: self.writer.write(blended)
 
     def process(self):
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
         frame_idx = 0
         start_all = time.time()
+        read_times = []
+        write_times = []
+        process_times = []
         while True:
+            t_process_start = time.time()
+            t_read_start = time.time()
             ret, frame = self.cap.read()
+            t_read_end = time.time()
+            read_times.append(t_read_end - t_read_start)
             if not ret: break
             frame_idx += 1
             blob = self.model.preprocess(frame)
             slot = (frame_idx - 1) % self.num_reqs
             if self.model.userdata[slot] is not None:
+                t_write_start = time.time()
                 result_tuple = self.model.get_result(slot)
                 self.done_q.put(result_tuple)
+                t_write_end = time.time()
+                write_times.append(t_write_end - t_write_start)
             self.model.infer_async(slot, blob, frame_idx, frame)
+            t_process_end = time.time()
+            process_times.append(t_process_end - t_process_start)
+            # Log timings every 10 frames
+            if frame_idx % 10 == 0:
+                avg_read = sum(read_times[-10:]) / min(10, len(read_times))
+                avg_write = sum(write_times[-10:]) / min(10, len(write_times)) if write_times else 0
+                avg_process = sum(process_times[-10:]) / min(10, len(process_times))
+                logging.info(f"[Frame {frame_idx}] Avg read time: {avg_read:.4f}s, Avg write time: {avg_write:.4f}s, Avg process time: {avg_process:.4f}s")
         # Flush remaining
         for result_tuple in self.model.flush():
+            t_write_start = time.time()
             self.done_q.put(result_tuple)
+            t_write_end = time.time()
+            write_times.append(t_write_end - t_write_start)
         self.done_q.put(self.STOP)
         self.post_thread.join()
         self.cap.release()
         if self.writer: self.writer.release()
         total_time = time.time() - start_all
-        print(f"Done {frame_idx} frames in {total_time:.2f}s  →  {frame_idx/total_time:.2f} FPS (end-to-end)")
+        logging.info(f"Done {frame_idx} frames in {total_time:.2f}s  →  {frame_idx/total_time:.2f} FPS (end-to-end)")
 
     def process_image(self, image):
         """
@@ -169,11 +192,12 @@ class SegmentationVideoProcessor:
                     print(f"Processed and sent result to {addr}")
 
 def main():
-    VIDEO_PATH = os.path.join(os.path.dirname(__file__), "test", "test_video_6.mp4")
+    VIDEO_PATH = os.path.join(os.path.dirname(__file__), "test_videos", "test_video_6.mp4")
     MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentation-adas-0001.xml"
     NUM_REQS = 3
     WRITE_OUTPUT = True
     OUTPUT_PATH = "test_results/segmented_video.mp4"
+
     processor = SegmentationVideoProcessor(VIDEO_PATH, MODEL_PATH, WRITE_OUTPUT, NUM_REQS, output_path=OUTPUT_PATH)
     # Uncomment below to run socket server instead of video processing
     # processor.serve_socket(host='127.0.0.1', port=5000)
