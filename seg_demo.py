@@ -1,207 +1,266 @@
-import cv2, numpy as np, time, queue, threading, os
-from openvino.runtime import Core
+import os
+import time
 import socket
 import struct
 import logging
+import multiprocessing as mp
 
-class SegmentationModel:
-    def __init__(self, model_path, num_reqs=3):
-        self.core = Core()
-        self.model = self.core.read_model(model_path)
-        self.compiled = self.core.compile_model(self.model, "CPU", {
+import cv2
+import numpy as np
+from openvino.runtime import Core
+
+# ----------------------------- Config -----------------------------
+HOST = "127.0.0.1"
+PORT = 5000
+MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentation-adas-0001.xml"
+
+# Worker performance knobs
+INFERENCE_THREADS_PER_WORKER = 3     # try 3–4 depending on CPU
+JPEG_QUALITY = 75                    # 70–80 is a good speed/quality trade-off
+IN_QUEUE_MAX = 2                     # small buffers to avoid latency build-up
+OUT_QUEUE_MAX = 4
+
+LOG_EVERY_N_FRAMES = 20
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+
+# ----------------------------- Utils -----------------------------
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Receive exactly n bytes or raise ConnectionError."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Socket closed while receiving data")
+        buf += chunk
+    return buf
+
+
+# ------------------------- Worker process -------------------------
+def worker_loop(model_path: str, in_q: mp.Queue, out_q: mp.Queue, worker_id: int) -> None:
+    """
+    Each worker lives in its own process with its own OpenVINO Core/model.
+    Receives (frame_idx:int, frame:np.ndarray BGR) and returns (frame_idx, worker_id, jpg_bytes:bytes).
+    """
+    # Keep library thread counts small inside the worker
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    # Pin the worker to a disjoint set of cores (best-effort)
+    try:
+        n = os.cpu_count() or 8
+        half = max(1, n // 2)
+        core_set = set(range(0, half)) if worker_id == 0 else set(range(half, n))
+        os.sched_setaffinity(0, core_set)
+        logging.info(f"[W{worker_id}] pinned to cores: {sorted(core_set)}")
+    except Exception:
+        pass
+
+    core = Core()
+    model = core.read_model(model_path)
+    compiled = core.compile_model(
+        model,
+        "CPU",
+        {
             "PERFORMANCE_HINT": "LATENCY",
-            "NUM_STREAMS": "1",
-            "INFERENCE_NUM_THREADS": os.cpu_count() or 8,
-        })
-        self.inp = self.compiled.input(0)
-        self.outp = self.compiled.output(0)
-        self.in_h, self.in_w = int(self.inp.shape[2]), int(self.inp.shape[3])
-        self.num_reqs = num_reqs
-        self.requests = [self.compiled.create_infer_request() for _ in range(num_reqs)]
-        self.userdata = [None] * num_reqs
+            "NUM_STREAMS": "1",                             # one stream per worker
+            "INFERENCE_NUM_THREADS": INFERENCE_THREADS_PER_WORKER,
+        },
+    )
+    inp = compiled.input(0)
+    outp = compiled.output(0)
+    in_h, in_w = int(inp.shape[2]), int(inp.shape[3])
 
-    def preprocess(self, frame):
-        if frame.shape[1] != self.in_w or frame.shape[0] != self.in_h:
-            frame_resized = cv2.resize(frame, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR)
+    # Static color map for label → color
+    np.random.seed(42)
+    color_map = np.random.randint(0, 255, size=(256, 3), dtype=np.uint8)
+
+    while True:
+        item = in_q.get()
+        if item is None:  # shutdown
+            break
+
+        frame_idx, frame = item
+
+        # --- Preprocess (resize to model input, NHWC → NCHW uint8) ---
+        t0 = time.perf_counter()
+        if frame.shape[1] != in_w or frame.shape[0] != in_h:
+            frame_resized = cv2.resize(frame, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
         else:
             frame_resized = frame
         blob = frame_resized.transpose(2, 0, 1)[None].astype(np.uint8)
-        return blob
+        t1 = time.perf_counter()
 
-    def infer_async(self, slot, blob, frame_idx, frame):
-        req = self.requests[slot]
-        self.userdata[slot] = (frame_idx, frame.copy())
-        req.start_async({self.inp: blob})
+        # --- Inference ---
+        result = compiled([blob])[outp]
+        t2 = time.perf_counter()
 
-    def get_result(self, slot):
-        req = self.requests[slot]
-        req.wait()
-        result = req.get_output_tensor(self.outp.index).data[:]
-        frame_idx, frame = self.userdata[slot]
-        self.userdata[slot] = None
-        return frame_idx, frame, result
+        # --- Postprocess (colorize, resize back, blend) ---
+        seg_map = result.squeeze().astype(np.uint8)  # (H,W)
+        seg_overlay = color_map[seg_map]             # (H,W,3)
+        seg_overlay = cv2.resize(
+            seg_overlay, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST
+        )
+        blended = cv2.addWeighted(frame, 0.5, seg_overlay, 0.5, 0)
+        t3 = time.perf_counter()
 
-    def flush(self):
-        results = []
-        for slot, req in enumerate(self.requests):
-            if self.userdata[slot] is not None:
-                req.wait()
-                result = req.get_output_tensor(self.outp.index).data[:]
-                frame_idx, frame = self.userdata[slot]
-                results.append((frame_idx, frame, result))
-                self.userdata[slot] = None
-        return results
+        # --- Encode JPEG ---
+        ok, jpg = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        jpg_bytes = jpg.tobytes() if ok else b""
+        t4 = time.perf_counter()
 
-class SegmentationVideoProcessor:
-    def __init__(self, video_path, model_path, write_output=True, num_reqs=3, output_path = None):
-        self.video_path = video_path
-        self.model_path = model_path
-        self.write_output = write_output
-        self.num_reqs = num_reqs
-        self.cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open {video_path} with FFmpeg backend.")
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
-        self.W = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.H = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (self.W, self.H)) if write_output else None
-        np.random.seed(42)
-        self.color_map = np.random.randint(0, 255, size=(256, 3), dtype=np.uint8)
-        self.done_q = queue.Queue(maxsize=num_reqs * 2)
-        self.STOP = object()
-        self.model = SegmentationModel(model_path, num_reqs)
-        self.post_thread = threading.Thread(target=self.postproc_worker, daemon=True)
-        self.post_thread.start()
+        if frame_idx % LOG_EVERY_N_FRAMES == 0:
+            logging.info(
+                f"[W{worker_id} {frame_idx}] pre {t1-t0:.3f}s | "
+                f"infer {t2-t1:.3f}s | post {t3-t2:.3f}s | enc {t4-t3:.3f}s"
+            )
 
-    def postproc_worker(self):
-        while True:
-            item = self.done_q.get()
-            if item is self.STOP: break
-            frame_idx, frame_orig, result = item
-            seg_map = result.squeeze().astype(np.uint8)
-            seg_overlay = self.color_map[seg_map]
-            seg_overlay_resized = cv2.resize(seg_overlay, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-            blended = cv2.addWeighted(frame_orig, 0.5, seg_overlay_resized, 0.5, 0)
-            if self.writer: self.writer.write(blended)
+        out_q.put((frame_idx, worker_id, jpg_bytes))
 
-    def process(self):
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-        frame_idx = 0
-        start_all = time.time()
-        read_times = []
-        write_times = []
-        process_times = []
-        while True:
-            t_process_start = time.time()
-            t_read_start = time.time()
-            ret, frame = self.cap.read()
-            t_read_end = time.time()
-            read_times.append(t_read_end - t_read_start)
-            if not ret: break
-            frame_idx += 1
-            blob = self.model.preprocess(frame)
-            slot = (frame_idx - 1) % self.num_reqs
-            if self.model.userdata[slot] is not None:
-                t_write_start = time.time()
-                result_tuple = self.model.get_result(slot)
-                self.done_q.put(result_tuple)
-                t_write_end = time.time()
-                write_times.append(t_write_end - t_write_start)
-            self.model.infer_async(slot, blob, frame_idx, frame)
-            t_process_end = time.time()
-            process_times.append(t_process_end - t_process_start)
-            # Log timings every 10 frames
-            if frame_idx % 10 == 0:
-                avg_read = sum(read_times[-10:]) / min(10, len(read_times))
-                avg_write = sum(write_times[-10:]) / min(10, len(write_times)) if write_times else 0
-                avg_process = sum(process_times[-10:]) / min(10, len(process_times))
-                logging.info(f"[Frame {frame_idx}] Avg read time: {avg_read:.4f}s, Avg write time: {avg_write:.4f}s, Avg process time: {avg_process:.4f}s")
-        # Flush remaining
-        for result_tuple in self.model.flush():
-            t_write_start = time.time()
-            self.done_q.put(result_tuple)
-            t_write_end = time.time()
-            write_times.append(t_write_end - t_write_start)
-        self.done_q.put(self.STOP)
-        self.post_thread.join()
-        self.cap.release()
-        if self.writer: self.writer.release()
-        total_time = time.time() - start_all
-        logging.info(f"Done {frame_idx} frames in {total_time:.2f}s  →  {frame_idx/total_time:.2f} FPS (end-to-end)")
 
-    def process_image(self, image):
-        """
-        Process a single image and return the blended segmentation result.
-        Accepts either a numpy array or a file path.
-        """
-        if isinstance(image, str):
-            frame = cv2.imread(image)
-            if frame is None:
-                raise ValueError(f"Cannot read image from path: {image}")
-        else:
-            frame = image
+# --------------------------- Server (parent) ---------------------------
+class SegmentationServer:
+    def __init__(self, model_path: str, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
 
-        blob = self.model.preprocess(frame)
-        self.model.infer_async(0, blob, 0, frame)
-        frame_idx, frame_orig, result = self.model.get_result(0)
-        seg_map = result.squeeze().astype(np.uint8)
-        seg_overlay = self.color_map[seg_map]
-        seg_overlay_resized = cv2.resize(seg_overlay, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-        blended = cv2.addWeighted(frame_orig, 0.5, seg_overlay_resized, 0.5, 0)
-        return blended
+        # One input queue per worker, one shared output queue
+        self.in_queues = [mp.Queue(maxsize=IN_QUEUE_MAX), mp.Queue(maxsize=IN_QUEUE_MAX)]
+        self.out_queue = mp.Queue(maxsize=OUT_QUEUE_MAX)
 
-    def serve_socket(self, host='127.0.0.1', port=5000):
-        """
-        Start a socket server that waits for image bytes, processes them,
-        and returns the segmented image bytes to the client.
-        """
+        # Two worker processes
+        self.procs = [
+            mp.Process(target=worker_loop, args=(model_path, self.in_queues[0], self.out_queue, 0), daemon=True),
+            mp.Process(target=worker_loop, args=(model_path, self.in_queues[1], self.out_queue, 1), daemon=True),
+        ]
+        for p in self.procs:
+            p.start()
+        logging.info("Started 2 worker processes")
+
+    def stop(self) -> None:
+        # Graceful shutdown for workers
+        for q in self.in_queues:
+            q.put(None)
+        for p in self.procs:
+            p.join(timeout=2.0)
+        for p in self.procs:
+            if p.is_alive():
+                p.terminate()
+
+    def serve_pairs(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind((host, port))
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.host, self.port))
             server.listen(1)
-            print(f"Socket server listening on {host}:{port}")
+            logging.info(f"Socket server listening on {self.host}:{self.port}")
+
             while True:
                 conn, addr = server.accept()
-                with conn:
-                    print(f"Connected by {addr}")
-                    # Receive image size (4 bytes, unsigned int)
-                    size_data = conn.recv(4)
-                    if not size_data:
-                        continue
-                    img_size = struct.unpack('!I', size_data)[0]
-                    # Receive image bytes
-                    img_bytes = b''
-                    while len(img_bytes) < img_size:
-                        chunk = conn.recv(img_size - len(img_bytes))
-                        if not chunk:
-                            break
-                        img_bytes += chunk
-                    # Decode image
-                    nparr = np.frombuffer(img_bytes, np.uint8)
-                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if frame is None:
-                        print("Failed to decode image")
-                        continue
-                    # Process image
-                    result_img = self.process_image(frame)
-                    # Encode result as JPEG
-                    _, result_bytes = cv2.imencode('.jpg', result_img)
-                    result_bytes = result_bytes.tobytes()
-                    # Send result size and bytes
-                    conn.sendall(struct.pack('!I', len(result_bytes)))
-                    conn.sendall(result_bytes)
-                    print(f"Processed and sent result to {addr}")
+                logging.info(f"Connected by {addr}")
+                try:
+                    self.handle_client(conn)
+                except ConnectionError:
+                    logging.info("Client disconnected")
+                except Exception as e:
+                    logging.exception(f"Error handling client: {e}")
+                finally:
+                    conn.close()
+                    logging.info(f"Connection closed for {addr}")
 
-def main():
-    VIDEO_PATH = os.path.join(os.path.dirname(__file__), "test_videos", "test_video_6.mp4")
-    MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentation-adas-0001.xml"
-    NUM_REQS = 3
-    WRITE_OUTPUT = True
-    OUTPUT_PATH = "test_results/segmented_video.mp4"
+    def handle_client(self, conn: socket.socket) -> None:
+        while True:
+            t0 = time.perf_counter()
 
-    processor = SegmentationVideoProcessor(VIDEO_PATH, MODEL_PATH, WRITE_OUTPUT, NUM_REQS, output_path=OUTPUT_PATH)
-    # Uncomment below to run socket server instead of video processing
-    # processor.serve_socket(host='127.0.0.1', port=5000)
-    processor.process()
+            # ---- receive paired request ----
+            idx_bytes = recv_exact(conn, 4)
+            frame_idx = struct.unpack("!I", idx_bytes)[0]
+
+            img1_size = struct.unpack("!I", recv_exact(conn, 4))[0]
+            img1_bytes = recv_exact(conn, img1_size)
+
+            img2_size = struct.unpack("!I", recv_exact(conn, 4))[0]
+            img2_bytes = recv_exact(conn, img2_size)
+
+            t_after_recv = time.perf_counter()
+
+            # ---- decode ----
+            frame1 = cv2.imdecode(np.frombuffer(img1_bytes, np.uint8), cv2.IMREAD_COLOR)
+            frame2 = cv2.imdecode(np.frombuffer(img2_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if frame1 is None or frame2 is None:
+                logging.warning("Decode failed for one of the frames")
+                break
+
+            t_after_decode = time.perf_counter()
+
+            # ---- dispatch to workers ----
+            self.in_queues[0].put((frame_idx, frame1))
+            self.in_queues[1].put((frame_idx, frame2))
+
+            t_after_dispatch = time.perf_counter()
+
+            # ---- gather both results for this frame_idx ----
+            res = {0: None, 1: None}
+            arrive = {}
+            while res[0] is None or res[1] is None:
+                idx, worker_id, jpg_bytes = self.out_queue.get()
+                now = time.perf_counter()
+                if idx == frame_idx and worker_id in (0, 1) and res[worker_id] is None:
+                    res[worker_id] = jpg_bytes
+                    arrive[worker_id] = now
+
+            t_after_wait = max(arrive.values())
+
+            res1_bytes = res[0]
+            res2_bytes = res[1]
+            if not res1_bytes or not res2_bytes:
+                logging.error("One of the workers failed to encode result")
+                break
+
+            # ---- send both results together ----
+            conn.sendall(struct.pack("!I", frame_idx))
+            conn.sendall(struct.pack("!I", len(res1_bytes))); conn.sendall(res1_bytes)
+            conn.sendall(struct.pack("!I", len(res2_bytes))); conn.sendall(res2_bytes)
+
+            t_after_send = time.perf_counter()
+
+            # ---- timings ----
+            d_recv     = t_after_recv     - t0
+            d_decode   = t_after_decode   - t_after_recv
+            d_dispatch = t_after_dispatch - t_after_decode
+            d_wait     = t_after_wait     - t_after_dispatch
+            d_send     = t_after_send     - t_after_wait
+            d_total    = t_after_send     - t0
+            w0_wait    = arrive.get(0, t_after_wait) - t_after_dispatch
+            w1_wait    = arrive.get(1, t_after_wait) - t_after_dispatch
+
+            logging.info(
+                f"pair {frame_idx}: total {d_total:.3f}s | recv {d_recv:.3f} | "
+                f"decode {d_decode:.3f} | dispatch {d_dispatch:.3f} | "
+                f"wait {d_wait:.3f} [w0 {w0_wait:.3f}, w1 {w1_wait:.3f}] | send {d_send:.3f}"
+            )
+
+
+# ------------------------------ Main ------------------------------
+def main() -> None:
+    # 'spawn' is safest across Docker/WSL/Windows
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    server = SegmentationServer(MODEL_PATH, HOST, PORT)
+    try:
+        server.serve_pairs()
+    finally:
+        server.stop()
+
 
 if __name__ == "__main__":
     main()
