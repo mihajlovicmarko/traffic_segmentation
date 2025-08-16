@@ -1,26 +1,18 @@
-import os
-import time
-import socket
-import struct
-import logging
-import argparse
+# client_async.py
+import os, time, socket, struct, logging, argparse
+import cv2, numpy as np
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
-import cv2
-import numpy as np
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = b''
+    buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Socket closed while receiving data")
+        if not chunk: raise ConnectionError("Socket closed while receiving data")
         buf += chunk
     return buf
-
 
 def open_cap(path: str) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
@@ -28,177 +20,181 @@ def open_cap(path: str) -> cv2.VideoCapture:
         raise FileNotFoundError(f"Cannot open video: {path}")
     return cap
 
-
 def make_writer(path: str, fps: float, w: int, h: int) -> cv2.VideoWriter:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"XVID")
     return cv2.VideoWriter(path, fourcc, fps, (w, h))
 
-
 def encode_jpg(img: np.ndarray, quality: int) -> bytes:
     ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok:
-        raise RuntimeError("JPEG encode failed")
+    if not ok: raise RuntimeError("JPEG encode failed")
     return buf.tobytes()
 
-
+# ----------------- async PAIR -----------------
 def run_pair(args):
-    cap1 = open_cap(args.video1)
-    cap2 = open_cap(args.video2)
+    cap1 = open_cap(args.video1); cap2 = open_cap(args.video2)
+    fps = cap1.get(cv2.CAP_PROP_FPS) or 25.0
+    w1,h1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w2,h2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    wri1 = make_writer(args.out1, fps, w1, h1); wri2 = make_writer(args.out2, fps, w2, h2)
 
-    fps = cap1.get(cv2.CAP_PROP_FPS) or 25.0  # pace from stream 1
-    w1, h1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    w2, h2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    inflight_sem = threading.Semaphore(args.max_inflight)
+    sender_done = threading.Event()
+    frame_sent = 0
+    start = time.time()
 
-    writer1 = make_writer(args.out1, fps, w1, h1)
-    writer2 = make_writer(args.out2, fps, w2, h2)
-
-    frame_idx = 0
-    start_time = time.time()
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, ThreadPoolExecutor(max_workers=2) as pool:
         s.connect((args.host, args.port))
-        logging.info(f"Connected to server at {args.host}:{args.port} (pair mode)")
+        logging.info(f"Connected to server {args.host}:{args.port} (pair mode, max_inflight={args.max_inflight})")
 
-        pool = ThreadPoolExecutor(max_workers=2)
+        def sender():
+            nonlocal frame_sent
+            try:
+                while True:
+                    ret1,f1 = cap1.read(); ret2,f2 = cap2.read()
+                    if not ret1 or not ret2: break
+                    inflight_sem.acquire()  # throttle
+                    frame_sent += 1
+                    idx = frame_sent
 
-        while True:
-            ret1, frame1 = cap1.read()
-            ret2, frame2 = cap2.read()
-            if not ret1 or not ret2:
-                break
+                    # parallel JPEG for small boost
+                    fut1 = pool.submit(encode_jpg, f1, args.jpeg_quality)
+                    fut2 = pool.submit(encode_jpg, f2, args.jpeg_quality)
+                    b1, b2 = fut1.result(), fut2.result()
 
-            frame_idx += 1
+                    s.sendall(struct.pack('!I', idx))
+                    s.sendall(struct.pack('!I', len(b1))); s.sendall(b1)
+                    s.sendall(struct.pack('!I', len(b2))); s.sendall(b2)
+            except Exception as e:
+                logging.error(f"sender error: {e}")
+            finally:
+                sender_done.set()
 
-            # Encode both frames in parallel for a little speedup
-            f1 = pool.submit(encode_jpg, frame1, args.jpeg_quality)
-            f2 = pool.submit(encode_jpg, frame2, args.jpeg_quality)
-            img1_bytes, img2_bytes = f1.result(), f2.result()
+        def receiver():
+            frames_done = 0
+            try:
+                while True:
+                    try:
+                        resp_idx = struct.unpack('!I', recv_exact(s, 4))[0]
+                    except ConnectionError:
+                        break
 
-            # ---- send pair ----
-            s.sendall(struct.pack('!I', frame_idx))
-            s.sendall(struct.pack('!I', len(img1_bytes))); s.sendall(img1_bytes)
-            s.sendall(struct.pack('!I', len(img2_bytes))); s.sendall(img2_bytes)
+                    sz1 = struct.unpack('!I', recv_exact(s, 4))[0]
+                    rb1 = recv_exact(s, sz1)
+                    sz2 = struct.unpack('!I', recv_exact(s, 4))[0]
+                    rb2 = recv_exact(s, sz2)
 
-            # ---- receive paired results ----
-            resp_idx = struct.unpack('!I', recv_exact(s, 4))[0]
-            if resp_idx != frame_idx:
-                logging.warning(f"Frame index mismatch: sent {frame_idx}, got {resp_idx}")
+                    img1 = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
+                    img2 = cv2.imdecode(np.frombuffer(rb2, np.uint8), cv2.IMREAD_COLOR)
+                    if img1 is None or img2 is None:
+                        logging.error("Result decode failed"); break
+                    if (img1.shape[1],img1.shape[0])!=(w1,h1): img1=cv2.resize(img1,(w1,h1))
+                    if (img2.shape[1],img2.shape[0])!=(w2,h2): img2=cv2.resize(img2,(w2,h2))
+                    wri1.write(img1); wri2.write(img2)
 
-            res1_size = struct.unpack('!I', recv_exact(s, 4))[0]
-            res1_bytes = recv_exact(s, res1_size)
+                    inflight_sem.release()
+                    frames_done += 1
+                    if frames_done % 10 == 0:
+                        elapsed = time.time()-start
+                        logging.info(f"RX wrote {frames_done} pairs, avg FPS: {frames_done/elapsed:.2f}")
+                    # exit when sender finished AND all inflight drained
+                    if sender_done.is_set() and inflight_sem._value == args.max_inflight:
+                        break
+            except Exception as e:
+                logging.error(f"receiver error: {e}")
 
-            res2_size = struct.unpack('!I', recv_exact(s, 4))[0]
-            res2_bytes = recv_exact(s, res2_size)
+        t_s = threading.Thread(target=sender, daemon=True)
+        t_r = threading.Thread(target=receiver, daemon=True)
+        t_s.start(); t_r.start()
+        t_s.join(); t_r.join()
 
-            res1_img = cv2.imdecode(np.frombuffer(res1_bytes, np.uint8), cv2.IMREAD_COLOR)
-            res2_img = cv2.imdecode(np.frombuffer(res2_bytes, np.uint8), cv2.IMREAD_COLOR)
-            if res1_img is None or res2_img is None:
-                logging.error("Failed to decode result images")
-                break
+    cap1.release(); cap2.release(); wri1.release(); wri2.release()
+    logging.info("Done pair.")
 
-            if (res1_img.shape[1], res1_img.shape[0]) != (w1, h1):
-                res1_img = cv2.resize(res1_img, (w1, h1), interpolation=cv2.INTER_LINEAR)
-            if (res2_img.shape[1], res2_img.shape[0]) != (w2, h2):
-                res2_img = cv2.resize(res2_img, (w2, h2), interpolation=cv2.INTER_LINEAR)
-
-            writer1.write(res1_img)
-            writer2.write(res2_img)
-
-            if frame_idx % 10 == 0:
-                elapsed = time.time() - start_time
-                cur_fps = frame_idx / elapsed if elapsed > 0 else 0
-                logging.info(f"Processed {frame_idx} paired frames, avg FPS: {cur_fps:.2f}")
-
-    cap1.release(); cap2.release()
-    writer1.release(); writer2.release()
-    logging.info(f"Done. Total paired frames: {frame_idx}.\n  {args.out1}\n  {args.out2}")
-
-
+# ----------------- async SINGLE -----------------
 def run_single(args):
-    # Pick source/out by --single-source
-    if args.single_source == 1:
-        vid_path, out_path = args.video1, args.out1
-    else:
-        vid_path, out_path = args.video2, args.out2
-
-    cap = open_cap(vid_path)
+    vid = args.video1 if args.single_source==1 else args.video2
+    out = args.out1 if args.single_source==1 else args.out2
+    cap = open_cap(vid)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = make_writer(out_path, fps, w, h)
+    w,h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    wri = make_writer(out, fps, w, h)
 
-    frame_idx = 0
-    start_time = time.time()
+    inflight_sem = threading.Semaphore(args.max_inflight)
+    sender_done = threading.Event()
+    frame_sent = 0
+    start = time.time()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((args.host, args.port))
-        logging.info(f"Connected to server at {args.host}:{args.port} (single mode, source {args.single_source})")
+        logging.info(f"Connected to server {args.host}:{args.port} (single mode, max_inflight={args.max_inflight})")
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        def sender():
+            nonlocal frame_sent
+            try:
+                while True:
+                    ret, f = cap.read()
+                    if not ret: break
+                    inflight_sem.acquire()
+                    frame_sent += 1
+                    idx = frame_sent
+                    b = encode_jpg(f, args.jpeg_quality)
+                    s.sendall(struct.pack('!I', idx))
+                    s.sendall(struct.pack('!I', len(b))); s.sendall(b)
+            finally:
+                sender_done.set()
 
-            frame_idx += 1
+        def receiver():
+            frames_done = 0
+            try:
+                while True:
+                    try:
+                        idx = struct.unpack('!I', recv_exact(s, 4))[0]
+                    except ConnectionError:
+                        break
+                    sz = struct.unpack('!I', recv_exact(s, 4))[0]
+                    rb = recv_exact(s, sz)
+                    img = cv2.imdecode(np.frombuffer(rb, np.uint8), cv2.IMREAD_COLOR)
+                    if img is None: break
+                    if (img.shape[1],img.shape[0])!=(w,h): img=cv2.resize(img,(w,h))
+                    wri.write(img)
+                    inflight_sem.release()
+                    frames_done += 1
+                    if frames_done % 10 == 0:
+                        elapsed = time.time()-start
+                        logging.info(f"RX wrote {frames_done} frames, avg FPS: {frames_done/elapsed:.2f}")
+                    if sender_done.is_set() and inflight_sem._value == args.max_inflight:
+                        break
+            except Exception as e:
+                logging.error(f"receiver error: {e}")
 
-            img_bytes = encode_jpg(frame, args.jpeg_quality)
+        t_s = threading.Thread(target=sender, daemon=True)
+        t_r = threading.Thread(target=receiver, daemon=True)
+        t_s.start(); t_r.start()
+        t_s.join(); t_r.join()
 
-            # ---- send single ----
-            s.sendall(struct.pack('!I', frame_idx))
-            s.sendall(struct.pack('!I', len(img_bytes))); s.sendall(img_bytes)
-
-            # ---- receive single result ----
-            resp_idx = struct.unpack('!I', recv_exact(s, 4))[0]
-            if resp_idx != frame_idx:
-                logging.warning(f"Frame index mismatch: sent {frame_idx}, got {resp_idx}")
-
-            res_size = struct.unpack('!I', recv_exact(s, 4))[0]
-            res_bytes = recv_exact(s, res_size)
-            res_img = cv2.imdecode(np.frombuffer(res_bytes, np.uint8), cv2.IMREAD_COLOR)
-            if res_img is None:
-                logging.error("Failed to decode result image")
-                break
-
-            if (res_img.shape[1], res_img.shape[0]) != (w, h):
-                res_img = cv2.resize(res_img, (w, h), interpolation=cv2.INTER_LINEAR)
-
-            writer.write(res_img)
-
-            if frame_idx % 10 == 0:
-                elapsed = time.time() - start_time
-                cur_fps = frame_idx / elapsed if elapsed > 0 else 0
-                logging.info(f"Processed {frame_idx} frames (single), avg FPS: {cur_fps:.2f}")
-
-    cap.release()
-    writer.release()
-    logging.info(f"Done. Total frames: {frame_idx}.\n  {out_path}")
-
+    cap.release(); wri.release()
+    logging.info("Done single.")
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Client for segmentation server (pair or single).")
-    ap.add_argument("--mode", choices=["pair", "single"], default="pair",
-                    help="Protocol mode to match the server.")
-    ap.add_argument("--single-source", type=int, choices=[1, 2], default=1,
-                    help="Which video to use in --mode single.")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=5000)
-
+    ap = argparse.ArgumentParser("Async client")
+    ap.add_argument("--mode", choices=["pair","single"], default="pair")
+    ap.add_argument("--single-source", type=int, choices=[1,2], default=1)
+    ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--video1", default="test_videos/test_video_5.mp4")
     ap.add_argument("--video2", default="test_videos/test_video_6.mp4")
     ap.add_argument("--out1",   default="test_results/segmented_result_5.avi")
     ap.add_argument("--out2",   default="test_results/segmented_result_6.avi")
-
     ap.add_argument("--jpeg-quality", type=int, default=75)
+    ap.add_argument("--max-inflight", type=int, default=12)  # window size
     return ap.parse_args()
-
 
 def main():
     args = parse_args()
-    if args.mode == "pair":
+    if args.mode=="pair":
         run_pair(args)
     else:
         run_single(args)
-
 
 if __name__ == "__main__":
     main()

@@ -40,47 +40,77 @@ docker build -t my-openvino-ffmpeg:2025.2.0 .
 docker run -it --rm --user root -v C:\Users\Marko\Projekti\openvino-road:/workspace my-openvino-ffmpeg:2025.2.0 bash
 ```
 
+
 ### 2. Start the Segmentation Server
 
+By default, the server runs in **pair mode** (processes two video streams in parallel):
+
 ```
-python seg_demo.py
+python seg_demo.py --mode pair
+```
+
+To run in **single mode** (process a single video stream, using all CPU cores):
+
+```
+python seg_demo.py --mode single
+```
+
+You can also override model, host, port, threads, and JPEG quality:
+
+```
+python seg_demo.py --mode pair --model <path_to_model.xml> --host 0.0.0.0 --port 5000 --threads-per-worker 4 --jpeg-quality 80
 ```
 
 ### 3. Run the Test Client
 
+For paired video processing (default):
+
 ```
-python tests/test_socket_client.py
+python tests/test_socket_client.py --mode pair
+```
+
+For single video processing (choose source 1 or 2):
+
+```
+python tests/test_socket_client.py --mode single --single-source 1
 ```
 
 Segmented results will be saved in the `test_results/` directory.
 
 ## How It Works
 
+
 1. **Server (`seg_demo.py`)**
-    - Loads the OpenVINO model and starts two worker processes.
-    - Listens for incoming socket connections.
-    - For each pair of frames received, dispatches them to workers, collects results, and sends back segmented images.
+    - Loads the OpenVINO model and starts worker process(es).
+    - In **pair mode**, two workers each process one video stream, each pinned to a separate set of CPU cores.
+    - In **single mode**, one worker uses all available CPU cores for maximum throughput.
+    - Listens for incoming socket connections and processes requests according to the selected mode.
+    - Logs detailed per-stage timings (preprocessing, inference, postprocessing, encoding) for each frame.
 
 2. **Client (`test_socket_client.py`)**
-    - Reads two video files frame-by-frame.
-    - Sends paired frames to the server over a socket.
+    - Reads one or two video files frame-by-frame.
+    - Sends frames to the server over a socket, matching the selected mode.
     - Receives segmented results and writes them to output videos.
 
 ## Model
 
 The default model is [semantic-segmentation-adas-0001](https://docs.openvino.ai/latest/omz_models_model_semantic_segmentation_adas_0001.html), included in the `intel/` directory in multiple precisions (FP16, FP16-INT8, FP32).
 
+
 ## Customization
 
-- **Change input videos:** Edit `VIDEO_PATH_1` and `VIDEO_PATH_2` in `tests/test_socket_client.py`.
-- **Change model:** Update `MODEL_PATH` in `seg_demo.py` to use a different model or precision.
-- **Tune performance:** Adjust `INFERENCE_THREADS_PER_WORKER`, `JPEG_QUALITY`, and queue sizes in `seg_demo.py`.
+- **Change input videos:** Use `--video1` and `--video2` arguments for the client, or edit the defaults in `tests/test_socket_client.py`.
+- **Change model:** Use `--model` argument for the server, or edit `MODEL_PATH` in `seg_demo.py`.
+- **Tune performance:** Use `--threads-per-worker` and `--jpeg-quality` for the server, or edit the defaults in `seg_demo.py`.
+- **Switch between single and pair mode:** Use `--mode single` or `--mode pair` for both server and client.
+
 
 ## Troubleshooting
 
 - **OpenVINO not found:** Make sure OpenVINO is installed and available in your Python environment.
-- **Socket connection errors:** Ensure the server is running before starting the client.
-- **Video not found:** Check that the paths in `test_videos/` are correct and files exist.
+- **Socket connection errors:** Ensure the server is running before starting the client, and that both use the same `--mode`.
+- **Video not found:** Check that the paths in `test_videos/` are correct and files exist, or use the `--video1`/`--video2` arguments.
+- **Performance:** In single mode, all CPU cores are used for maximum throughput. In pair mode, each worker is pinned to a separate set of cores for balanced parallelism. See server logs for detailed timing breakdowns.
 
 ## License
 
