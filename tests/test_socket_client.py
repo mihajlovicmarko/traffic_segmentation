@@ -72,6 +72,7 @@ def run_pair(args):
 
         def receiver():
             frames_done = 0
+            last_time = time.time() 
             try:
                 while True:
                     try:
@@ -94,10 +95,13 @@ def run_pair(args):
 
                     inflight_sem.release()
                     frames_done += 1
-                    if frames_done % 10 == 0:
-                        elapsed = time.time()-start
-                        logging.info(f"RX wrote {frames_done} pairs, avg FPS: {frames_done/elapsed:.2f}")
+                    if frames_done % 20 == 0:
+                        elapsed = time.time()
+                        logging.info(f"RX wrote {frames_done} pairs, avg FPS: {20.0/(elapsed-last_time):.2f}")
+                        last_time = time.time()
+                        
                     # exit when sender finished AND all inflight drained
+
                     if sender_done.is_set() and inflight_sem._value == args.max_inflight:
                         break
             except Exception as e:
