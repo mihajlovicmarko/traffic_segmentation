@@ -37,7 +37,8 @@ This project demonstrates real-time semantic segmentation of road scenes using O
 
 ```
 docker build -t my-openvino-ffmpeg:2025.2.0 .
-docker run -it --rm --user root -v C:\Users\Marko\Projekti\openvino-road:/workspace my-openvino-ffmpeg:2025.2.0 bash
+
+docker run -it --rm --name segserver --user root -p 5000:5000 -v "C:\Users\Marko\Projekti\openvino-road:/workspace" my-openvino-ffmpeg:2025.2.0  bash
 ```
 
 

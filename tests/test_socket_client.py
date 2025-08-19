@@ -87,8 +87,15 @@ def run_pair(args):
 
                     img1 = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
                     img2 = cv2.imdecode(np.frombuffer(rb2, np.uint8), cv2.IMREAD_COLOR)
+
                     if img1 is None or img2 is None:
                         logging.error("Result decode failed"); break
+                    if args.show:
+                        cv2.imshow("Processed Video 1", img1)
+                        cv2.imshow("Processed Video 2", img2)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
+
                     if (img1.shape[1],img1.shape[0])!=(w1,h1): img1=cv2.resize(img1,(w1,h1))
                     if (img2.shape[1],img2.shape[0])!=(w2,h2): img2=cv2.resize(img2,(w2,h2))
                     wri1.write(img1); wri2.write(img2)
@@ -114,6 +121,9 @@ def run_pair(args):
 
     cap1.release(); cap2.release(); wri1.release(); wri2.release()
     logging.info("Done pair.")
+    if args.show:
+        cv2.destroyAllWindows()
+
 
 # ----------------- async SINGLE -----------------
 def run_single(args):
@@ -160,6 +170,11 @@ def run_single(args):
                     rb = recv_exact(s, sz)
                     img = cv2.imdecode(np.frombuffer(rb, np.uint8), cv2.IMREAD_COLOR)
                     if img is None: break
+                    if args.show:
+                        cv2.imshow("Processed Video", img)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
+
                     if (img.shape[1],img.shape[0])!=(w,h): img=cv2.resize(img,(w,h))
                     wri.write(img)
                     inflight_sem.release()
@@ -177,8 +192,12 @@ def run_single(args):
         t_s.start(); t_r.start()
         t_s.join(); t_r.join()
 
+
     cap.release(); wri.release()
     logging.info("Done single.")
+    if args.show:
+        cv2.destroyAllWindows()
+
 
 def parse_args():
     ap = argparse.ArgumentParser("Async client")
@@ -190,7 +209,9 @@ def parse_args():
     ap.add_argument("--out1",   default="test_results/segmented_result_5.avi")
     ap.add_argument("--out2",   default="test_results/segmented_result_6.avi")
     ap.add_argument("--jpeg-quality", type=int, default=75)
-    ap.add_argument("--max-inflight", type=int, default=12)  # window size
+    ap.add_argument("--max-inflight", type=int, default=12)  
+    ap.add_argument("--show", action="store_true",
+                help="Display processed frames in a cv2 window")
     return ap.parse_args()
 
 def main():
