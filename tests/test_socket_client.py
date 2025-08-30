@@ -15,9 +15,13 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return buf
 
 def open_cap(path: str) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+    # If path is int, treat as camera index
+    if isinstance(path, int):
+        cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
+    else:
+        cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
-        raise FileNotFoundError(f"Cannot open video: {path}")
+        raise FileNotFoundError(f"Cannot open video/camera: {path}")
     return cap
 
 def make_writer(path: str, fps: float, w: int, h: int) -> cv2.VideoWriter:
@@ -32,11 +36,16 @@ def encode_jpg(img: np.ndarray, quality: int) -> bytes:
 
 # ----------------- async PAIR -----------------
 def run_pair(args):
-    cap1 = open_cap(args.video1); cap2 = open_cap(args.video2)
+    # Select camera or video for each input
+    src1 = args.camera1 if hasattr(args, 'camera1') and args.camera1 is not None else args.video1
+    src2 = args.camera2 if hasattr(args, 'camera2') and args.camera2 is not None else args.video2
+    cap1 = open_cap(src1); cap2 = open_cap(src2)
     fps = cap1.get(cv2.CAP_PROP_FPS) or 25.0
     w1,h1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w2,h2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    wri1 = make_writer(args.out1, fps, w1, h1); wri2 = make_writer(args.out2, fps, w2, h2)
+    # Only write output if not using camera
+    wri1 = make_writer(args.out1, fps, w1, h1) if (not hasattr(args, 'camera1') or args.camera1 is None) else None
+    wri2 = make_writer(args.out2, fps, w2, h2) if (not hasattr(args, 'camera2') or args.camera2 is None) else None
 
     inflight_sem = threading.Semaphore(args.max_inflight)
     sender_done = threading.Event()
@@ -90,7 +99,9 @@ def run_pair(args):
 
                     if img1 is None or img2 is None:
                         logging.error("Result decode failed"); break
-                    if args.show:
+                    # Always show if using camera, or if --show is set
+                    show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
+                    if show_live:
                         cv2.imshow("Processed Video 1", img1)
                         cv2.imshow("Processed Video 2", img2)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -98,7 +109,8 @@ def run_pair(args):
 
                     if (img1.shape[1],img1.shape[0])!=(w1,h1): img1=cv2.resize(img1,(w1,h1))
                     if (img2.shape[1],img2.shape[0])!=(w2,h2): img2=cv2.resize(img2,(w2,h2))
-                    wri1.write(img1); wri2.write(img2)
+                    if wri1: wri1.write(img1)
+                    if wri2: wri2.write(img2)
 
                     inflight_sem.release()
                     frames_done += 1
@@ -119,20 +131,34 @@ def run_pair(args):
         t_s.start(); t_r.start()
         t_s.join(); t_r.join()
 
-    cap1.release(); cap2.release(); wri1.release(); wri2.release()
+    cap1.release(); cap2.release()
+    if wri1: wri1.release()
+    if wri2: wri2.release()
     logging.info("Done pair.")
-    if args.show:
+    # Always destroy windows if live display was used
+    if (hasattr(args, 'camera1') and args.camera1 is not None) or (hasattr(args, 'camera2') and args.camera2 is not None) or args.show:
         cv2.destroyAllWindows()
 
 
 # ----------------- async SINGLE -----------------
 def run_single(args):
-    vid = args.video1 if args.single_source==1 else args.video2
-    out = args.out1 if args.single_source==1 else args.out2
-    cap = open_cap(vid)
+    # Select camera or video for input
+    if hasattr(args, 'camera1') and args.single_source == 1 and args.camera1 is not None:
+        src = args.camera1
+        out = args.out1
+        use_camera = True
+    elif hasattr(args, 'camera2') and args.single_source == 2 and args.camera2 is not None:
+        src = args.camera2
+        out = args.out2
+        use_camera = True
+    else:
+        src = args.video1 if args.single_source==1 else args.video2
+        out = args.out1 if args.single_source==1 else args.out2
+        use_camera = False
+    cap = open_cap(src)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     w,h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    wri = make_writer(out, fps, w, h)
+    wri = make_writer(out, fps, w, h) if not use_camera else None
 
     inflight_sem = threading.Semaphore(args.max_inflight)
     sender_done = threading.Event()
@@ -170,13 +196,15 @@ def run_single(args):
                     rb = recv_exact(s, sz)
                     img = cv2.imdecode(np.frombuffer(rb, np.uint8), cv2.IMREAD_COLOR)
                     if img is None: break
-                    if args.show:
+                    # Always show if using camera, or if --show is set
+                    show_live = use_camera or args.show
+                    if show_live:
                         cv2.imshow("Processed Video", img)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             break
 
                     if (img.shape[1],img.shape[0])!=(w,h): img=cv2.resize(img,(w,h))
-                    wri.write(img)
+                    if wri: wri.write(img)
                     inflight_sem.release()
                     frames_done += 1
                     if frames_done % 10 == 0:
@@ -193,9 +221,10 @@ def run_single(args):
         t_s.join(); t_r.join()
 
 
-    cap.release(); wri.release()
+    cap.release()
+    if wri: wri.release()
     logging.info("Done single.")
-    if args.show:
+    if use_camera or args.show:
         cv2.destroyAllWindows()
 
 
@@ -206,6 +235,8 @@ def parse_args():
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--video1", default="test_videos/test_video_5.mp4")
     ap.add_argument("--video2", default="test_videos/test_video_6.mp4")
+    ap.add_argument("--camera1", type=int, default=None, help="Use camera index for input 1 (overrides --video1)")
+    ap.add_argument("--camera2", type=int, default=None, help="Use camera index for input 2 (overrides --video2)")
     ap.add_argument("--out1",   default="test_results/segmented_result_5.avi")
     ap.add_argument("--out2",   default="test_results/segmented_result_6.avi")
     ap.add_argument("--jpeg-quality", type=int, default=75)
