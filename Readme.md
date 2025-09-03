@@ -64,19 +64,35 @@ python seg_demo.py --mode pair --model <path_to_model.xml> --host 0.0.0.0 --port
 
 ### 3. Run the Test Client
 
-For paired video processing (default):
+#### Video or Camera Input
+
+You can use video files (default) or live camera(s) as input for the test client.
+
+**Paired video processing (default):**
 
 ```
 python tests/test_socket_client.py --mode pair
 ```
 
-For single video processing (choose source 1 or 2):
+**Paired camera processing:**
+
+```
+python tests/test_socket_client.py --mode pair --camera1 0 --camera2 1
+```
+
+**Single video processing (choose source 1 or 2):**
 
 ```
 python tests/test_socket_client.py --mode single --single-source 1
 ```
 
-Segmented results will be saved in the `test_results/` directory.
+**Single camera processing:**
+
+```
+python tests/test_socket_client.py --mode single --camera1 0
+```
+
+When using a camera, results are displayed live in a window. When using video files, results are saved in the `test_results/` directory by default.
 
 ## How It Works
 
@@ -89,9 +105,9 @@ Segmented results will be saved in the `test_results/` directory.
     - Logs detailed per-stage timings (preprocessing, inference, postprocessing, encoding) for each frame.
 
 2. **Client (`test_socket_client.py`)**
-    - Reads one or two video files frame-by-frame.
+    - Reads one or two video files **or** live camera streams frame-by-frame.
     - Sends frames to the server over a socket, matching the selected mode.
-    - Receives segmented results and writes them to output videos.
+    - Receives segmented results and writes them to output videos (for video input) or displays them live (for camera input).
 
 ## Model
 
@@ -99,8 +115,9 @@ The default model is [semantic-segmentation-adas-0001](https://docs.openvino.ai/
 
 
 ## Customization
-
+  
 - **Change input videos:** Use `--video1` and `--video2` arguments for the client, or edit the defaults in `tests/test_socket_client.py`.
+- **Use a camera as input:** Use `--camera1` and/or `--camera2` to select camera indices (e.g., `--camera1 0`).
 - **Change model:** Use `--model` argument for the server, or edit `MODEL_PATH` in `seg_demo.py`.
 - **Tune performance:** Use `--threads-per-worker` and `--jpeg-quality` for the server, or edit the defaults in `seg_demo.py`.
 - **Switch between single and pair mode:** Use `--mode single` or `--mode pair` for both server and client.

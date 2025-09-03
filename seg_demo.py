@@ -1,4 +1,3 @@
-# server_async.py
 import os, time, socket, struct, logging, argparse, multiprocessing as mp, threading, queue
 import cv2, numpy as np
 from openvino.runtime import Core  # keep as-is (deprecation warning ok)
@@ -9,11 +8,11 @@ PORT = 5000
 MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentation-adas-0001.xml"
 
 INFERENCE_THREADS_PER_WORKER = 3   # overridable via CLI
-JPEG_QUALITY = 75
-IN_QUEUE_MAX = 4                   # per-worker queue
-OUT_QUEUE_MAX = 16                 # shared out queue (results)
-PAIR_QUEUE_MAX = 16                # decoded frames waiting to be dispatched
-MAX_INFLIGHT = 12                  # “window” of pairs/singles dispatched but not yet replied
+JPEG_QUALITY = 40
+IN_QUEUE_MAX = 2                   # per-worker queue
+OUT_QUEUE_MAX = 4                # shared out queue (results)
+PAIR_QUEUE_MAX = 4                # decoded frames waiting to be dispatched
+MAX_INFLIGHT = 6                 # “window” of pairs/singles dispatched but not yet replied
 
 LOG_EVERY_N_FRAMES = 20
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -76,6 +75,7 @@ def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker
         seg_map = result.squeeze().astype(np.uint8)
         seg_overlay = color_map[seg_map]
         seg_overlay = cv2.resize(seg_overlay, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+        alpha = globals().get('BLEND_ALPHA', 0.5)
         blended = cv2.addWeighted(frame, 0.5, seg_overlay, 0.5, 0)
         t3 = time.perf_counter()
 
@@ -327,13 +327,103 @@ class SegmentationServer:
 def parse_args():
     ap = argparse.ArgumentParser("Segmentation server (async)")
     ap.add_argument("--mode", choices=["pair","single"], default="pair")
-    ap.add_argument("--host", default=HOST); ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--host", default=HOST) 
+    ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--threads-per-worker", type=int, default=INFERENCE_THREADS_PER_WORKER)
     ap.add_argument("--jpeg-quality", type=int, default=JPEG_QUALITY)
     ap.add_argument("--max-inflight", type=int, default=MAX_INFLIGHT)
     ap.add_argument("--pair-queue-max", type=int, default=PAIR_QUEUE_MAX)
+    ap.add_argument("--blend-alpha", type=float, default=0.5, help="Transparency for overlay (0.0-1.0, default=0.5)")
+    # Offline mode args
+    ap.add_argument("--process-ids", action="store_true",
+                    help="Run offline: read a video, produce class-ID masks, save as a single .npy array (no socket).")
+    ap.add_argument("--input-video", default=None,
+                    help="Path to input video file (required with --process-ids).")
+    ap.add_argument("--output-npy", default=None,
+                    help="Path to output .npy file (required with --process-ids).")
     return ap.parse_args()
+# ------------------------------ Offline Processor ------------------------------
+def process_video_ids(model_path: str, input_video: str, output_npy: str, threads_per_worker: int):
+    """
+    Offline pipeline:
+      - Load model on CPU
+      - Read frames from input_video
+      - For each frame, run segmentation -> class IDs (uint8)
+      - Resize IDs back to original frame size
+      - Stack into (T, H, W) and save to output_npy
+    """
+    if not os.path.isfile(input_video):
+        raise FileNotFoundError(f"Input video not found: {input_video}")
+
+    # Light thread/env pinning (same spirit as workers)
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    logging.info(f"[IDS] Loading model: {model_path}")
+    core = Core()
+    model = core.read_model(model_path)
+    compiled = core.compile_model(
+        model, "CPU",
+        {"PERFORMANCE_HINT":"LATENCY", "NUM_STREAMS":"1", "INFERENCE_NUM_THREADS": int(threads_per_worker)}
+    )
+    inp = compiled.input(0); outp = compiled.output(0)
+    in_h, in_w = int(inp.shape[2]), int(inp.shape[3])
+
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {input_video}")
+
+    ids_frames = []
+    frame_idx = 0
+    t_global0 = time.perf_counter()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        h, w = frame.shape[:2]
+
+        t0 = time.perf_counter()
+        if w != in_w or h != in_h:
+            frame_resized = cv2.resize(frame, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            frame_resized = frame
+
+        # NCHW uint8 (model expects 8-bit)
+        blob = frame_resized.transpose(2, 0, 1)[None].astype(np.uint8)
+        t1 = time.perf_counter()
+
+        result = compiled([blob])[outp]  # (1, H, W) or (H, W)
+        seg_map = result.squeeze().astype(np.uint8)  # (in_h, in_w) class IDs
+        t2 = time.perf_counter()
+
+        # Resize IDs back to original frame size (NEAREST to preserve labels)
+        seg_ids = cv2.resize(seg_map, (w, h), interpolation=cv2.INTER_NEAREST)
+        ids_frames.append(seg_ids)
+
+        if frame_idx % LOG_EVERY_N_FRAMES == 0:
+            logging.info(f"[IDS {frame_idx}] pre {(t1-t0):.3f}s | infer {(t2-t1):.3f}s")
+
+        frame_idx += 1
+
+    cap.release()
+    if not ids_frames:
+        raise RuntimeError("No frames were read from the video.")
+
+    # Stack to (T, H, W) uint8 and save
+    arr = np.stack(ids_frames, axis=0).astype(np.uint8)
+    np.save(output_npy, arr, allow_pickle=False)
+    t_global1 = time.perf_counter()
+
+    logging.info(f"[IDS] Saved {arr.shape} uint8 to: {output_npy} | total time {(t_global1 - t_global0):.2f}s")
 
 def main():
     try:
@@ -341,6 +431,23 @@ def main():
     except RuntimeError:
         pass
     args = parse_args()
+    # Offline mode: detach from client, process video -> npy
+    if args.process_ids:
+        if not args.input_video or not args.output_npy:
+            raise SystemExit("--process-ids requires --input-video and --output-npy")
+
+        logging.info("Running in process-ids (offline) mode: no socket server will be started.")
+        process_video_ids(
+            model_path=args.model,
+            input_video=args.input_video,
+            output_npy=args.output_npy,
+            threads_per_worker=args.threads_per_worker
+        )
+        return
+
+    # Online mode: original socket server
+    global BLEND_ALPHA
+    BLEND_ALPHA = args.blend_alpha
     srv = SegmentationServer(args.model, args.host, args.port, mode=args.mode,
                              max_inflight=args.max_inflight, pair_queue_max=args.pair_queue_max,
                              threads_per_worker=args.threads_per_worker, jpeg_quality=args.jpeg_quality)

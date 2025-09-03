@@ -7,5 +7,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+RUN pip install --no-cache-dir \
+      opencv-python-headless \
+      numpy \
+      requests \
+      Pillow \
+      matplotlib \
+      jupyterlab \
+      notebook \
+      ipywidgets \
+      pandas \
+      scikit-learn \
+      scikit-image \
+      seaborn \
+      tqdm
+
 # drop back to the openvino user
 USER openvino

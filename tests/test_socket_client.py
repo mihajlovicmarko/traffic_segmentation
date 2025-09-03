@@ -156,7 +156,7 @@ def run_single(args):
         out = args.out1 if args.single_source==1 else args.out2
         use_camera = False
     cap = open_cap(src)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps = 10 #cap.get(cv2.CAP_PROP_FPS) or 25.0
     w,h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     wri = make_writer(out, fps, w, h) if not use_camera else None
 
