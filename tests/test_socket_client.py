@@ -239,7 +239,7 @@ def parse_args():
     ap.add_argument("--camera2", type=int, default=None, help="Use camera index for input 2 (overrides --video2)")
     ap.add_argument("--out1",   default="test_results/segmented_result_5.avi")
     ap.add_argument("--out2",   default="test_results/segmented_result_6.avi")
-    ap.add_argument("--jpeg-quality", type=int, default=75)
+    ap.add_argument("--jpeg-quality", type=int, default=40)
     ap.add_argument("--max-inflight", type=int, default=12)  
     ap.add_argument("--show", action="store_true",
                 help="Display processed frames in a cv2 window")

@@ -9,7 +9,7 @@ MODEL_PATH = "intel/semantic-segmentation-adas-0001/FP16-INT8/semantic-segmentat
 
 INFERENCE_THREADS_PER_WORKER = 3   # overridable via CLI
 JPEG_QUALITY = 40
-IN_QUEUE_MAX = 2                   # per-worker queue
+IN_QUEUE_MAX = 1                  # per-worker queue
 OUT_QUEUE_MAX = 4                # shared out queue (results)
 PAIR_QUEUE_MAX = 4                # decoded frames waiting to be dispatched
 MAX_INFLIGHT = 6                 # “window” of pairs/singles dispatched but not yet replied
