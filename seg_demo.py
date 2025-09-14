@@ -76,7 +76,7 @@ def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker
         seg_overlay = color_map[seg_map]
         seg_overlay = cv2.resize(seg_overlay, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
         alpha = globals().get('BLEND_ALPHA', 0.5)
-        blended = cv2.addWeighted(frame, 0.5, seg_overlay, 0.5, 0)
+        blended = cv2.addWeighted(frame, 0, seg_overlay, 1, 0)
         t3 = time.perf_counter()
 
         ok, jpg = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])

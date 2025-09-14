@@ -142,6 +142,7 @@ def run_pair(args):
 
 # ----------------- async SINGLE -----------------
 def run_single(args):
+    
     # Select camera or video for input
     if hasattr(args, 'camera1') and args.single_source == 1 and args.camera1 is not None:
         src = args.camera1
@@ -157,6 +158,7 @@ def run_single(args):
         use_camera = False
     cap = open_cap(src)
     fps = 10 #cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
     w,h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     wri = make_writer(out, fps, w, h) if not use_camera else None
 

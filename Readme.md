@@ -21,6 +21,15 @@ This project demonstrates real-time semantic segmentation of road scenes using O
 ├── test_videos/               # Example input videos
 ├── test_results/              # Output segmented videos
 ```
+## Start Notebook (develeopment)
+python3 -m notebook --allow-root \
+  --ServerApp.ip=0.0.0.0 \
+  --ServerApp.port=8888 \
+  --ServerApp.root_dir=/workspace \
+  --ServerApp.token='' --ServerApp.password=''
+
+
+
 
 ## Requirements
 
@@ -31,6 +40,18 @@ This project demonstrates real-time semantic segmentation of road scenes using O
 
 > **Tip:** The provided `Dockerfile` can be used to build a ready-to-run environment.
 
+### Optional start notebook
+
+'''
+python3 -m notebook --allow-root \
+  --ServerApp.ip=0.0.0.0 \
+  --ServerApp.port=8888 \
+  --ServerApp.root_dir=/workspace \
+  --ServerApp.token='' --ServerApp.password=''
+'''
+
+
+
 ## Quick Start
 
 ### 1. Build and Run with Docker
@@ -38,7 +59,7 @@ This project demonstrates real-time semantic segmentation of road scenes using O
 ```
 docker build -t my-openvino-ffmpeg:2025.2.0 .
 
-docker run -it --rm --name segserver --user root -p 5000:5000 -v "C:\Users\Marko\Projekti\openvino-road:/workspace" my-openvino-ffmpeg:2025.2.0  bash
+docker run -it --rm --name segserver --user root -w /workspace -p 5000:5000 -p 8888:8888 -v "C:\Users\Marko\Projekti\openvino-road:/workspace" my-openvino-ffmpeg:2025.2.0  bash
 ```
 
 
