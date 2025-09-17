@@ -48,6 +48,7 @@ def run_pair(args):
     wri2 = make_writer(args.out2, fps, w2, h2) if (not hasattr(args, 'camera2') or args.camera2 is None) else None
 
     inflight_sem = threading.Semaphore(args.max_inflight)
+    send_timestamps = {}  # frame_idx -> send_time
     sender_done = threading.Event()
     frame_sent = 0
     start = time.time()
@@ -65,6 +66,7 @@ def run_pair(args):
                     inflight_sem.acquire()  # throttle
                     frame_sent += 1
                     idx = frame_sent
+                    send_timestamps[idx] = time.time()
 
                     # parallel JPEG for small boost
                     fut1 = pool.submit(encode_jpg, f1, args.jpeg_quality)
@@ -88,6 +90,11 @@ def run_pair(args):
                         resp_idx = struct.unpack('!I', recv_exact(s, 4))[0]
                     except ConnectionError:
                         break
+
+                    # Log round-trip delay
+                    if resp_idx in send_timestamps:
+                        delay = time.time() - send_timestamps.pop(resp_idx)
+                        logging.info(f"Frame {resp_idx} round-trip delay: {delay:.3f} sec")
 
                     sz1 = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb1 = recv_exact(s, sz1)
@@ -163,6 +170,7 @@ def run_single(args):
     wri = make_writer(out, fps, w, h) if not use_camera else None
 
     inflight_sem = threading.Semaphore(args.max_inflight)
+    send_timestamps = {}  # frame_idx -> send_time
     sender_done = threading.Event()
     frame_sent = 0
     start = time.time()
@@ -180,6 +188,7 @@ def run_single(args):
                     inflight_sem.acquire()
                     frame_sent += 1
                     idx = frame_sent
+                    send_timestamps[idx] = time.time()
                     b = encode_jpg(f, args.jpeg_quality)
                     s.sendall(struct.pack('!I', idx))
                     s.sendall(struct.pack('!I', len(b))); s.sendall(b)
@@ -194,6 +203,10 @@ def run_single(args):
                         idx = struct.unpack('!I', recv_exact(s, 4))[0]
                     except ConnectionError:
                         break
+                    # Log round-trip delay
+                    if idx in send_timestamps:
+                        delay = time.time() - send_timestamps.pop(idx)
+                        logging.info(f"Frame {idx} round-trip delay: {delay:.3f} sec")
                     sz = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb = recv_exact(s, sz)
                     img = cv2.imdecode(np.frombuffer(rb, np.uint8), cv2.IMREAD_COLOR)

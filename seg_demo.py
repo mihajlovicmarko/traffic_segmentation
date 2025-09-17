@@ -221,10 +221,14 @@ class SegmentationServer:
 
                 pair = partial.get(idx)
                 if pair and pair[0] is not None and pair[1] is not None:
-                    # send as soon as both ready
-                    conn.sendall(struct.pack("!I", idx))
-                    conn.sendall(struct.pack("!I", len(pair[0]))); conn.sendall(pair[0])
-                    conn.sendall(struct.pack("!I", len(pair[1]))); conn.sendall(pair[1])
+                    try:
+                        # send as soon as both ready
+                        conn.sendall(struct.pack("!I", idx))
+                        conn.sendall(struct.pack("!I", len(pair[0]))); conn.sendall(pair[0])
+                        conn.sendall(struct.pack("!I", len(pair[1]))); conn.sendall(pair[1])
+                    except (BrokenPipeError, ConnectionResetError):
+                        logging.warning("Client disconnected during send (pair mode)")
+                        break
 
                     # timings
                     t_disp = dispatch_time.pop(idx, None)
@@ -304,9 +308,13 @@ class SegmentationServer:
                     idx, wid, data, pre, inf, post, enc = item
                 else:
                     idx, wid, data = item
-                # send immediately
-                conn.sendall(struct.pack("!I", idx))
-                conn.sendall(struct.pack("!I", len(data))); conn.sendall(data)
+                try:
+                    # send immediately
+                    conn.sendall(struct.pack("!I", idx))
+                    conn.sendall(struct.pack("!I", len(data))); conn.sendall(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    logging.warning("Client disconnected during send (single mode)")
+                    break
 
                 t_disp = dispatch_time.pop(idx, None)
                 if t_disp is not None and len(item)==7:
