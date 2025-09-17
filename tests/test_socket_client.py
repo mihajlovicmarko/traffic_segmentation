@@ -40,6 +40,9 @@ def run_pair(args):
     src1 = args.camera1 if hasattr(args, 'camera1') and args.camera1 is not None else args.video1
     src2 = args.camera2 if hasattr(args, 'camera2') and args.camera2 is not None else args.video2
     cap1 = open_cap(src1); cap2 = open_cap(src2)
+    cap1.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
     fps = cap1.get(cv2.CAP_PROP_FPS) or 25.0
     w1,h1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w2,h2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
