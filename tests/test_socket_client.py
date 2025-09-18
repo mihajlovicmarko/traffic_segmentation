@@ -3,7 +3,7 @@ import os, time, socket, struct, logging, argparse
 import cv2, numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import threading
-from utils import make_projector_and_grid, make_rotating_rect_tensor, process_two_bev_frames, npy_frame_to_bev
+from utils import make_projector_and_grid, make_rotating_rect_tensor, process_two_bev_frames, npy_frame_to_bev, combine_viz_and_denoised
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -182,12 +182,13 @@ def run_pair(args):
                         blur_ksize=11,
                         blur_sigma=6.0
                     )
+                    
                     if show_live:
                         #cv2.imshow("Processed Video 1", img1)
                         #cv2.imshow("Processed Video 2", img2)
                         
                         pass
-                        cv2.imshow("Road detection and following", viz_img)
+                        cv2.imshow("Road detection and following", combine_viz_and_denoised(viz_img, denoised_frame))
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             break
 
