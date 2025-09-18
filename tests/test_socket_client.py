@@ -3,6 +3,8 @@ import os, time, socket, struct, logging, argparse
 import cv2, numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from utils import make_projector_and_grid, make_rotating_rect_tensor, process_two_bev_frames, npy_frame_to_bev
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -56,11 +58,39 @@ def run_pair(args):
     frame_sent = 0
     start = time.time()
 
+
+    projector_left, grid_left = make_projector_and_grid(
+        frame_shape=tuple(args.frame_shape),
+        fx=300.0, fy=int(530/380*200),
+        height_m=1.0,
+        pitch_deg_down=0.0,
+        meters_per_pixel=0.20,
+        forward_range=(0.5, 30.0),
+        lateral_range=(-20.0, 20.0),
+    )
+    projector_right, grid_right = make_projector_and_grid(
+        frame_shape=tuple(args.frame_shape),
+        fx=380.0, fy=530.0,
+        height_m=1.0,
+        pitch_deg_down=0.0,
+        meters_per_pixel=0.20,
+        forward_range=(0.5, 30.0),
+        lateral_range=(-20.0, 20.0),
+    )
+    flower_tensor_road = make_rotating_rect_tensor(H=236, W=330, n= 100, length=130, thickness=5)
+    flower_tensor_collision = make_rotating_rect_tensor(H=236, W=330, n= 100, length=60, thickness=5)
+
+
+
+
+
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, ThreadPoolExecutor(max_workers=2) as pool:
         s.connect((args.host, args.port))
         logging.info(f"Connected to server {args.host}:{args.port} (pair mode, max_inflight={args.max_inflight})")
 
         def sender():
+            print("Sender started")
             nonlocal frame_sent
             try:
                 while True:
@@ -87,7 +117,8 @@ def run_pair(args):
         def receiver():
             frames_done = 0
             last_time = time.time() 
-            try:
+            state = None   
+            if True:
                 while True:
                     try:
                         resp_idx = struct.unpack('!I', recv_exact(s, 4))[0]
@@ -104,23 +135,62 @@ def run_pair(args):
                     sz2 = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb2 = recv_exact(s, sz2)
 
-                    img1 = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
-                    img2 = cv2.imdecode(np.frombuffer(rb2, np.uint8), cv2.IMREAD_COLOR)
+                    if args.payload == "jpg":
+                        img1 = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
+                        img2 = cv2.imdecode(np.frombuffer(rb2, np.uint8), cv2.IMREAD_COLOR)
+                        if img1 is None or img2 is None:
+                            logging.error("Result decode failed"); break
+                        
+                        if (img1.shape[1],img1.shape[0])!=(w1,h1): img1=cv2.resize(img1,(w1,h1))
+                        if (img2.shape[1],img2.shape[0])!=(w2,h2): img2=cv2.resize(img2,(w2,h2))
+                        if wri1: wri1.write(img1)
+                        if wri2: wri2.write(img2)
 
-                    if img1 is None or img2 is None:
-                        logging.error("Result decode failed"); break
+                    else:
+                        import io
+                        ids1 = np.load(io.BytesIO(rb1))  # (H,W) uint8 labels
+                        ids2 = np.load(io.BytesIO(rb2))
+                        bev_frame_left = npy_frame_to_bev(ids1, projector_left, grid_left, road_label=0)
+                        bev_frame_right = npy_frame_to_bev(ids2, projector_right, grid_right, road_label=0)
+
                     # Always show if using camera, or if --show is set
                     show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
+                    
+
+                    
+                    viz_img, denoised_frame, state, res = process_two_bev_frames(
+                        bev_frame_left, 
+                        bev_frame_right,
+                        flower_tensor_road, flower_tensor_collision,
+                        state,
+                        combine_angle_deg=-35.0,
+                        combine_hshift_px=40,
+                        centre_bias_coefficient=0.6,
+                        sigma_scores=4.0,
+                        remembrance=8.0,
+                        residual_sigma=16.0,
+                        convergent_with_road=5.0,
+                        road_min_abs=40,
+                        road_min_frac_of_max=0.10,
+                        collision_min_abs=300,
+                        collision_min_frac_of_max=0.30,
+                        small_top_k=1,
+                        road_color=(100,255,100),
+                        selected_road_color=(0,255,255),
+                        small_color=(0,0,255),
+                        morph_kernel=4,
+                        blur_ksize=11,
+                        blur_sigma=6.0
+                    )
                     if show_live:
-                        cv2.imshow("Processed Video 1", img1)
-                        cv2.imshow("Processed Video 2", img2)
+                        #cv2.imshow("Processed Video 1", img1)
+                        #cv2.imshow("Processed Video 2", img2)
+                        
+                        pass
+                        cv2.imshow("Road detection and following", viz_img)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             break
 
-                    if (img1.shape[1],img1.shape[0])!=(w1,h1): img1=cv2.resize(img1,(w1,h1))
-                    if (img2.shape[1],img2.shape[0])!=(w2,h2): img2=cv2.resize(img2,(w2,h2))
-                    if wri1: wri1.write(img1)
-                    if wri2: wri2.write(img2)
 
                     inflight_sem.release()
                     frames_done += 1
@@ -133,8 +203,8 @@ def run_pair(args):
 
                     if sender_done.is_set() and inflight_sem._value == args.max_inflight:
                         break
-            except Exception as e:
-                logging.error(f"receiver error: {e}")
+            #except Exception as e:
+            #    logging.error(f"receiver error: {e}")
 
         t_s = threading.Thread(target=sender, daemon=True)
         t_r = threading.Thread(target=receiver, daemon=True)
@@ -261,6 +331,9 @@ def parse_args():
     ap.add_argument("--max-inflight", type=int, default=12)  
     ap.add_argument("--show", action="store_true",
                 help="Display processed frames in a cv2 window")
+    ap.add_argument("--frame-shape", nargs=2, type=int, default=[480, 640], metavar=("HEIGHT", "WIDTH"),
+                help="Frame shape as HEIGHT WIDTH (default: 480 640)")
+    ap.add_argument("--payload", choices=["jpg","ids"], default="jpg", help="Payload type: jpg (default) or ids (label map)")
     return ap.parse_args()
 
 def main():

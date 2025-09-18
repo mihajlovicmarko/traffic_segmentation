@@ -1,5 +1,6 @@
 import os, time, socket, struct, logging, argparse, multiprocessing as mp, threading, queue
 import cv2, numpy as np
+import io
 from openvino.runtime import Core  # keep as-is (deprecation warning ok)
 
 # ----------------------------- Defaults -----------------------------
@@ -17,6 +18,83 @@ MAX_INFLIGHT = 6                 # “window” of pairs/singles dispatched but 
 LOG_EVERY_N_FRAMES = 20
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
+# ------------------------------ Offline stream processor ------------------------------
+
+def stream_video_ids(model_path: str, host: str, port: int, input_video: str, threads_per_worker: int):
+    """
+    Run segmentation on a video and stream each frame's class-ID map as .npy bytes
+    to a single client over a socket using the same framing:
+        idx | len | payload
+    """
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    logging.info(f"[IDS-STREAM] Loading model: {model_path}")
+    core = Core()
+    model = core.read_model(model_path)
+    compiled = core.compile_model(
+        model, "CPU",
+        {"PERFORMANCE_HINT":"LATENCY", "NUM_STREAMS":"1", "INFERENCE_NUM_THREADS": int(threads_per_worker)}
+    )
+    inp = compiled.input(0); outp = compiled.output(0)
+    in_h, in_w = int(inp.shape[2]), int(inp.shape[3])
+
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {input_video}")
+
+    # Bind and wait for a single client
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((host, port))
+        srv.listen(1)
+        logging.info(f"[IDS-STREAM] Listening on {host}:{port}")
+        conn, addr = srv.accept()
+        logging.info(f"[IDS-STREAM] Client connected: {addr}")
+
+        idx = 1
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                h, w = frame.shape[:2]
+                t0 = time.perf_counter()
+                if w != in_w or h != in_h:
+                    frame_resized = cv2.resize(frame, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    frame_resized = frame
+                blob = frame_resized.transpose(2,0,1)[None].astype(np.uint8)
+                result = compiled([blob])[outp]
+                seg_map = result.squeeze().astype(np.uint8)
+                seg_ids = cv2.resize(seg_map, (w, h), interpolation=cv2.INTER_NEAREST)
+
+                buf = io.BytesIO()
+                np.save(buf, seg_ids, allow_pickle=False)
+                data = buf.getvalue()
+
+                # framing: idx | len | payload
+                conn.sendall(struct.pack("!I", idx))
+                conn.sendall(struct.pack("!I", len(data)))
+                conn.sendall(data)
+
+                if idx % LOG_EVERY_N_FRAMES == 0:
+                    logging.info(f"[IDS-STREAM {idx}] sent {len(data)} bytes")
+                idx += 1
+        finally:
+            try: conn.close()
+            except: pass
+            cap.release()
+            logging.info("[IDS-STREAM] Done.")
+
+
 # ----------------------------- Utils -----------------------------
 def recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = b""
@@ -28,7 +106,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return buf
 
 # ------------------------- Worker process -------------------------
-def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker, jpeg_quality):
+def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker, jpeg_quality, payload):
     try:
         cv2.setNumThreads(1)
     except Exception:
@@ -58,7 +136,7 @@ def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker
     while True:
         item = in_q.get()
         if item is None:
-            break
+            break  # Stop signal
         frame_idx, frame = item
 
         t0 = time.perf_counter()
@@ -72,34 +150,46 @@ def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker
         result = compiled([blob])[outp]
         t2 = time.perf_counter()
 
+        # IDs at network resolution
         seg_map = result.squeeze().astype(np.uint8)
-        seg_overlay = color_map[seg_map]
-        seg_overlay = cv2.resize(seg_overlay, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-        alpha = globals().get('BLEND_ALPHA', 0.5)
-        blended = cv2.addWeighted(frame, 0, seg_overlay, 1, 0)
-        t3 = time.perf_counter()
 
-        ok, jpg = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
-        jpg_bytes = jpg.tobytes() if ok else b""
-        t4 = time.perf_counter()
+        # Resize IDs back to original frame size
+        seg_ids = cv2.resize(seg_map, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-        pre, infer, post, enc = (t1-t0, t2-t1, t3-t2, t4-t3)
+        # Build payload
+        if payload == "jpg":
+            seg_overlay = color_map[seg_ids]    # (H,W,3) uint8
+            alpha = globals().get('BLEND_ALPHA', 0.5)
+            blended = cv2.addWeighted(frame, 0, seg_overlay, 1, 0)
+            t3 = time.perf_counter()
+            ok, jpg = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+            data_bytes = jpg.tobytes() if ok else b""
+            t4 = time.perf_counter()
+            pre, infer, post, enc = (t1-t0, t2-t1, t3-t2, t4-t3)
+        else:
+            # payload == "ids": send .npy bytes
+            t3 = time.perf_counter()
+            buf = io.BytesIO()
+            np.save(buf, seg_ids, allow_pickle=False)
+            data_bytes = buf.getvalue()
+            t4 = time.perf_counter()
+            pre, infer, post, enc = (t1-t0, t2-t1, t3-t2, t4-t3)
+
         if frame_idx % LOG_EVERY_N_FRAMES == 0:
             logging.info(f"[W{worker_id} {frame_idx}] pre {pre:.3f}s | infer {infer:.3f}s | post {post:.3f}s | enc {enc:.3f}s")
 
-        out_q.put((frame_idx, worker_id, jpg_bytes, pre, infer, post, enc))
-
-# --------------------------- Server ---------------------------
+        out_q.put((frame_idx, worker_id, data_bytes, pre, infer, post, enc))
 class SegmentationServer:
     def __init__(self, model_path, host, port, mode="pair", max_inflight=MAX_INFLIGHT,
                  pair_queue_max=PAIR_QUEUE_MAX, threads_per_worker=INFERENCE_THREADS_PER_WORKER,
-                 jpeg_quality=JPEG_QUALITY):
+                 jpeg_quality=JPEG_QUALITY, payload="jpg"):
         self.host, self.port, self.mode = host, port, mode
         self.max_inflight = int(max_inflight)
         self.pair_queue_max = int(pair_queue_max)
         self.threads_per_worker = int(threads_per_worker)
         self.jpeg_quality = int(jpeg_quality)
-        logging.info(f"Server mode: {self.mode} | max_inflight={self.max_inflight}")
+        self.payload = payload
+        logging.info(f"Server mode: {self.mode} | max_inflight={self.max_inflight} | payload={self.payload}")
 
         # workers: 2 in pair mode, 1 in single mode
         self.num_workers = 2 if self.mode=="pair" else 1
@@ -116,7 +206,7 @@ class SegmentationServer:
         self.procs = [
             mp.Process(target=worker_loop,
                        args=(model_path, self.in_queues[i], self.out_queue, i, core_sets[i],
-                             self.threads_per_worker, self.jpeg_quality),
+                             self.threads_per_worker, self.jpeg_quality, self.payload),
                        daemon=True)
             for i in range(self.num_workers)
         ]
@@ -350,6 +440,10 @@ def parse_args():
                     help="Path to input video file (required with --process-ids).")
     ap.add_argument("--output-npy", default=None,
                     help="Path to output .npy file (required with --process-ids).")
+    ap.add_argument("--payload", choices=["jpg","ids"], default="jpg",
+                    help="What to send to the client. 'jpg' overlay or 'ids' as .npy bytes.")
+    ap.add_argument("--process-ids-stream", action="store_true",
+                    help="With --process-ids, stream per-frame ID maps to one socket client instead of saving a single .npy.")
     return ap.parse_args()
 # ------------------------------ Offline Processor ------------------------------
 def process_video_ids(model_path: str, input_video: str, output_npy: str, threads_per_worker: int):
@@ -449,7 +543,8 @@ def main():
             model_path=args.model,
             input_video=args.input_video,
             output_npy=args.output_npy,
-            threads_per_worker=args.threads_per_worker
+            threads_per_worker=args.threads_per_worker,
+            payload=args.payload
         )
         return
 
@@ -458,7 +553,8 @@ def main():
     BLEND_ALPHA = args.blend_alpha
     srv = SegmentationServer(args.model, args.host, args.port, mode=args.mode,
                              max_inflight=args.max_inflight, pair_queue_max=args.pair_queue_max,
-                             threads_per_worker=args.threads_per_worker, jpeg_quality=args.jpeg_quality)
+                             threads_per_worker=args.threads_per_worker, jpeg_quality=args.jpeg_quality,
+                             payload=args.payload)
     try:
         srv.serve()
     finally:
