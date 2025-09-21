@@ -1,7 +1,14 @@
 import os, time, socket, struct, logging, argparse, multiprocessing as mp, threading, queue
 import cv2, numpy as np
-import io
 from openvino.runtime import Core  # keep as-is (deprecation warning ok)
+from utils import (
+    make_projector_and_grid,
+    make_rotating_rect_tensor,
+    process_two_bev_frames,
+    npy_frame_to_bev,
+    combine_viz_and_denoised,
+)
+import io
 
 # ----------------------------- Defaults -----------------------------
 HOST = "127.0.0.1"
@@ -163,11 +170,11 @@ def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker
             blended = cv2.addWeighted(frame, 0, seg_overlay, 1, 0)
             t3 = time.perf_counter()
             ok, jpg = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
-            data_bytes = jpg.tobytes() if ok else b""
+            data_bytes = jpg.tobytes() if ok : b""
             t4 = time.perf_counter()
             pre, infer, post, enc = (t1-t0, t2-t1, t3-t2, t4-t3)
         else:
-            # payload == "ids": send .npy bytes
+            # payload in {"ids","viz"}: send .npy bytes
             t3 = time.perf_counter()
             buf = io.BytesIO()
             np.save(buf, seg_ids, allow_pickle=False)
@@ -213,6 +220,28 @@ class SegmentationServer:
         for p in self.procs:
             p.start()
         logging.info(f"Started {self.num_workers} worker process(es)")
+
+        # ---- Post-processing assets (used when payload == 'viz') ----
+        self.projector_left, self.grid_left = make_projector_and_grid(
+            frame_shape=(480, 640),   # <- set to your model/frame H,W (or pass via CLI if needed)
+            fx=300.0, fy=int(530/380*200),
+            height_m=1.0, pitch_deg_down=0.0,
+            meters_per_pixel=0.20,
+            forward_range=(0.5, 30.0),
+            lateral_range=(-20.0, 20.0),
+        )
+        self.projector_right, self.grid_right = make_projector_and_grid(
+            frame_shape=(480, 640),
+            fx=380.0, fy=530.0,
+            height_m=1.0, pitch_deg_down=0.0,
+            meters_per_pixel=0.20,
+            forward_range=(0.5, 30.0),
+            lateral_range=(-20.0, 20.0),
+        )
+        self.flower_tensor_road = make_rotating_rect_tensor(H=236, W=330, n=100, length=130, thickness=5)
+        self.flower_tensor_collision = make_rotating_rect_tensor(H=236, W=330, n=100, length=60, thickness=5)
+        # streaming state (one per connection ideally; we’ll keep a simple one here)
+        self.proc_state = None
 
     def stop(self):
         for q in self.in_queues:
@@ -312,10 +341,51 @@ class SegmentationServer:
                 pair = partial.get(idx)
                 if pair and pair[0] is not None and pair[1] is not None:
                     try:
-                        # send as soon as both ready
-                        conn.sendall(struct.pack("!I", idx))
-                        conn.sendall(struct.pack("!I", len(pair[0]))); conn.sendall(pair[0])
-                        conn.sendall(struct.pack("!I", len(pair[1]))); conn.sendall(pair[1])
+                        if self.payload == "viz":
+                            # Decode .npy -> ids arrays
+                            ids1 = np.load(io.BytesIO(pair[0]), allow_pickle=False)
+                            ids2 = np.load(io.BytesIO(pair[1]), allow_pickle=False)
+
+                            # BEV per side
+                            bev_left  = npy_frame_to_bev(ids1, projector=self.projector_left,  grid=self.grid_left,  road_label=0)
+                            bev_right = npy_frame_to_bev(ids2, projector=self.projector_right, grid=self.grid_right, road_label=0)
+
+                            # Run post-processing
+                            viz_img, denoised, self.proc_state, _ = process_two_bev_frames(
+                                bev_left, bev_right,
+                                self.flower_tensor_road, self.flower_tensor_collision,
+                                self.proc_state,
+                                combine_angle_deg=-35.0,
+                                combine_hshift_px=40,
+                                centre_bias_coefficient=0.6,
+                                sigma_scores=4.0,
+                                remembrance=8.0,
+                                residual_sigma=16.0,
+                                convergent_with_road=5.0,
+                                road_min_abs=40,
+                                road_min_frac_of_max=0.10,
+                                collision_min_abs=300,
+                                collision_min_frac_of_max=0.30,
+                                small_top_k=1,
+                                road_color=(100,255,100),
+                                selected_road_color=(0,255,255),
+                                small_color=(0,0,255),
+                                morph_kernel=4,
+                                blur_ksize=11,
+                                blur_sigma=6.0
+                            )
+                            final_img = combine_viz_and_denoised(viz_img, denoised)
+                            ok, jpg = cv2.imencode(".jpg", final_img, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
+                            out_bytes = jpg.tobytes() if ok : b""
+                            # Keep pair framing (send same viz twice)
+                            conn.sendall(struct.pack("!I", idx))
+                            conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
+                            conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
+                        else:
+                            # Existing behavior (jpg overlays or raw ids)
+                            conn.sendall(struct.pack("!I", idx))
+                            conn.sendall(struct.pack("!I", len(pair[0]))); conn.sendall(pair[0])
+                            conn.sendall(struct.pack("!I", len(pair[1]))); conn.sendall(pair[1])
                     except (BrokenPipeError, ConnectionResetError):
                         logging.warning("Client disconnected during send (pair mode)")
                         break
@@ -440,8 +510,8 @@ def parse_args():
                     help="Path to input video file (required with --process-ids).")
     ap.add_argument("--output-npy", default=None,
                     help="Path to output .npy file (required with --process-ids).")
-    ap.add_argument("--payload", choices=["jpg","ids"], default="jpg",
-                    help="What to send to the client. 'jpg' overlay or 'ids' as .npy bytes.")
+    ap.add_argument("--payload", choices=["jpg","ids","viz"], default="jpg",
+                    help="What to send to the client. 'jpg' overlay, 'ids' label maps, or 'viz' final combined visualization.")
     ap.add_argument("--process-ids-stream", action="store_true",
                     help="With --process-ids, stream per-frame ID maps to one socket client instead of saving a single .npy.")
     return ap.parse_args()

@@ -3,7 +3,6 @@ import os, time, socket, struct, logging, argparse
 import cv2, numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import threading
-from utils import make_projector_and_grid, make_rotating_rect_tensor, process_two_bev_frames, npy_frame_to_bev, combine_viz_and_denoised
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -59,31 +58,6 @@ def run_pair(args):
     start = time.time()
 
 
-    projector_left, grid_left = make_projector_and_grid(
-        frame_shape=tuple(args.frame_shape),
-        fx=300.0, fy=int(530/380*200),
-        height_m=1.0,
-        pitch_deg_down=0.0,
-        meters_per_pixel=0.20,
-        forward_range=(0.5, 30.0),
-        lateral_range=(-20.0, 20.0),
-    )
-    projector_right, grid_right = make_projector_and_grid(
-        frame_shape=tuple(args.frame_shape),
-        fx=380.0, fy=530.0,
-        height_m=1.0,
-        pitch_deg_down=0.0,
-        meters_per_pixel=0.20,
-        forward_range=(0.5, 30.0),
-        lateral_range=(-20.0, 20.0),
-    )
-    flower_tensor_road = make_rotating_rect_tensor(H=236, W=330, n= 100, length=130, thickness=5)
-    flower_tensor_collision = make_rotating_rect_tensor(H=236, W=330, n= 100, length=60, thickness=5)
-
-
-
-
-
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, ThreadPoolExecutor(max_workers=2) as pool:
         s.connect((args.host, args.port))
@@ -130,68 +104,31 @@ def run_pair(args):
                         delay = time.time() - send_timestamps.pop(resp_idx)
                         logging.info(f"Frame {resp_idx} round-trip delay: {delay:.3f} sec")
 
+                    # Read header + two payloads (pair framing)
                     sz1 = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb1 = recv_exact(s, sz1)
                     sz2 = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb2 = recv_exact(s, sz2)
 
-                    if args.payload == "jpg":
-                        img1 = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
-                        img2 = cv2.imdecode(np.frombuffer(rb2, np.uint8), cv2.IMREAD_COLOR)
-                        if img1 is None or img2 is None:
-                            logging.error("Result decode failed"); break
-                        
-                        if (img1.shape[1],img1.shape[0])!=(w1,h1): img1=cv2.resize(img1,(w1,h1))
-                        if (img2.shape[1],img2.shape[0])!=(w2,h2): img2=cv2.resize(img2,(w2,h2))
-                        if wri1: wri1.write(img1)
-                        if wri2: wri2.write(img2)
+                    # For payload == "viz", both rb1 and rb2 are identical JPGs.
+                    img = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
+                    if img is None:
+                        logging.error("Result decode failed")
+                        break
 
-                    else:
-                        import io
-                        ids1 = np.load(io.BytesIO(rb1))  # (H,W) uint8 labels
-                        ids2 = np.load(io.BytesIO(rb2))
-                        bev_frame_left = npy_frame_to_bev(ids1, projector_left, grid_left, road_label=0)
-                        bev_frame_right = npy_frame_to_bev(ids2, projector_right, grid_right, road_label=0)
+                    show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
+                                (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
 
-                    # Always show if using camera, or if --show is set
-                    show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
-                    
-
-                    
-                    viz_img, denoised_frame, state, res = process_two_bev_frames(
-                        bev_frame_left, 
-                        bev_frame_right,
-                        flower_tensor_road, flower_tensor_collision,
-                        state,
-                        combine_angle_deg=-35.0,
-                        combine_hshift_px=40,
-                        centre_bias_coefficient=0.6,
-                        sigma_scores=4.0,
-                        remembrance=8.0,
-                        residual_sigma=16.0,
-                        convergent_with_road=5.0,
-                        road_min_abs=40,
-                        road_min_frac_of_max=0.10,
-                        collision_min_abs=300,
-                        collision_min_frac_of_max=0.30,
-                        small_top_k=1,
-                        road_color=(100,255,100),
-                        selected_road_color=(0,255,255),
-                        small_color=(0,0,255),
-                        morph_kernel=4,
-                        blur_ksize=11,
-                        blur_sigma=6.0
-                    )
-                    
                     if show_live:
-                        #cv2.imshow("Processed Video 1", img1)
-                        #cv2.imshow("Processed Video 2", img2)
-                        
-                        pass
-                        cv2.imshow("Road detection and following", combine_viz_and_denoised(viz_img, denoised_frame))
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            break
+                        try:
+                            cv2.imshow("Road detection and following", img)
+                            if cv2.waitKey(1) & 0xFF == ord('q'):
+                                break
+                        except cv2.error:
+                            logging.warning("OpenCV built without GUI; disable --show or use xvfb-run.")
 
+                    if wri1: wri1.write(img)
+                    if wri2: wri2.write(img)  # both outputs get the same image
 
                     inflight_sem.release()
                     frames_done += 1
