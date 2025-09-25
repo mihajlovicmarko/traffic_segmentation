@@ -9,6 +9,7 @@ from utils import (
     combine_viz_and_denoised,
 )
 import io
+import datetime
 
 # ----------------------------- Defaults -----------------------------
 HOST = "127.0.0.1"
@@ -170,7 +171,7 @@ def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker
             blended = cv2.addWeighted(frame, 0, seg_overlay, 1, 0)
             t3 = time.perf_counter()
             ok, jpg = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
-            data_bytes = jpg.tobytes() if ok : b""
+            data_bytes = jpg.tobytes() if ok else b""
             t4 = time.perf_counter()
             pre, infer, post, enc = (t1-t0, t2-t1, t3-t2, t4-t3)
         else:
@@ -189,14 +190,30 @@ def worker_loop(model_path, in_q, out_q, worker_id, core_set, threads_per_worker
 class SegmentationServer:
     def __init__(self, model_path, host, port, mode="pair", max_inflight=MAX_INFLIGHT,
                  pair_queue_max=PAIR_QUEUE_MAX, threads_per_worker=INFERENCE_THREADS_PER_WORKER,
-                 jpeg_quality=JPEG_QUALITY, payload="jpg"):
+                 jpeg_quality=JPEG_QUALITY, payload="jpg",
+                 flower_road_length=130, flower_road_thickness=5,
+                 flower_collision_length=60, flower_collision_thickness=5,
+                 log_videos=False):
         self.host, self.port, self.mode = host, port, mode
         self.max_inflight = int(max_inflight)
         self.pair_queue_max = int(pair_queue_max)
         self.threads_per_worker = int(threads_per_worker)
         self.jpeg_quality = int(jpeg_quality)
         self.payload = payload
+        self.log_videos = log_videos
+        self.data_dir = os.path.join(os.getcwd(), "collected_data")
+        if self.log_videos:
+            os.makedirs(self.data_dir, exist_ok=True)
+        self.log_video_duration = 30  # seconds
         logging.info(f"Server mode: {self.mode} | max_inflight={self.max_inflight} | payload={self.payload}")
+
+        # writers and sizes (initialized to None)
+        self.left_orig_writer = self.right_orig_writer = None
+        self.left_proc_writer = self.right_proc_writer = None
+        self.post_writer = None
+        self.left_orig_writer_size = self.right_orig_writer_size = None
+        self.left_proc_writer_size = self.right_proc_writer_size = None
+        self.post_writer_size = None
 
         # workers: 2 in pair mode, 1 in single mode
         self.num_workers = 2 if self.mode=="pair" else 1
@@ -238,8 +255,10 @@ class SegmentationServer:
             forward_range=(0.5, 30.0),
             lateral_range=(-20.0, 20.0),
         )
-        self.flower_tensor_road = make_rotating_rect_tensor(H=236, W=330, n=100, length=130, thickness=5)
-        self.flower_tensor_collision = make_rotating_rect_tensor(H=236, W=330, n=100, length=60, thickness=5)
+        self.flower_tensor_road = make_rotating_rect_tensor(
+            H=236, W=330, n=100, length=flower_road_length, thickness=flower_road_thickness)
+        self.flower_tensor_collision = make_rotating_rect_tensor(
+            H=236, W=330, n=100, length=flower_collision_length, thickness=flower_collision_thickness)
         # streaming state (one per connection ideally; we’ll keep a simple one here)
         self.proc_state = None
 
@@ -281,25 +300,76 @@ class SegmentationServer:
         inflight_sem = threading.Semaphore(self.max_inflight)
         inflight_count = 0
         inflight_lock = threading.Lock()
-        dispatch_time = {}   # idx -> t_dispatch
+        dispatch_time = {}
 
-        # queue of decoded pairs waiting to be dispatched to workers
         pending_q: "queue.Queue[tuple[int,np.ndarray,np.ndarray]]" = queue.Queue(maxsize=self.pair_queue_max)
+
+        # --- Logging setup ---
+        # Remove all early writer creation; writers are now created lazily after decoding the first frame
+        if self.log_videos:
+            self._log_start_time = time.time()
+        else:
+            self.left_orig_writer = self.right_orig_writer = None
+            self.left_proc_writer = self.right_proc_writer = None
+            self.post_writer = None
+            self.left_orig_writer_size = self.right_orig_writer_size = None
+            self.left_proc_writer_size = self.right_proc_writer_size = None
+            self.post_writer_size = None
+            self._log_start_time = None
+
+        def _rotate_writers():
+            for attr in [
+                "left_orig_writer", "right_orig_writer",
+                "left_proc_writer", "right_proc_writer",
+                "post_writer"
+            ]:
+                writer = getattr(self, attr, None)
+                if writer:
+                    writer.release()
+                    setattr(self, attr, None)
+            time.sleep(0.1)  # brief pause to ensure file closure
+
+            if self.left_orig_writer: self.left_orig_writer.release()
+            if self.right_orig_writer: self.right_orig_writer.release()
+            if self.left_proc_writer: self.left_proc_writer.release()
+            if self.right_proc_writer: self.right_proc_writer.release()
+            if self.post_writer: self.post_writer.release()
+            self.left_orig_writer, _ = self._get_video_writer('left_original')
+            self.right_orig_writer, _ = self._get_video_writer('right_original')
+            self.left_proc_writer, _ = self._get_video_writer('left_processed')
+            self.right_proc_writer, _ = self._get_video_writer('right_processed')
+            self.post_writer, _ = self._get_video_writer('postprocessed')
+            self._log_start_time = time.time()
 
         def recv_thread():
             try:
                 while True:
+                    if self.log_videos and (self._log_start_time is not None) and (time.time() - self._log_start_time > self.log_video_duration):
+                        for a in ["left_orig_writer","right_orig_writer","left_proc_writer","right_proc_writer","post_writer"]:
+                            wr = getattr(self, a, None)
+                            if wr is not None:
+                                try: wr.release()
+                                except: pass
+                                setattr(self, a, None)
+                                setattr(self, a+"_size", None)
+                        self._log_start_time = time.time()
                     idx = struct.unpack("!I", recv_exact(conn, 4))[0]
                     s1 = struct.unpack("!I", recv_exact(conn, 4))[0]
                     b1 = recv_exact(conn, s1)
                     s2 = struct.unpack("!I", recv_exact(conn, 4))[0]
                     b2 = recv_exact(conn, s2)
-
                     f1 = cv2.imdecode(np.frombuffer(b1, np.uint8), cv2.IMREAD_COLOR)
                     f2 = cv2.imdecode(np.frombuffer(b2, np.uint8), cv2.IMREAD_COLOR)
                     if f1 is None or f2 is None:
                         logging.warning("Decode failed for one of the frames")
                         break
+                    if self.log_videos:
+                        if self._log_start_time is None:
+                            self._log_start_time = time.time()
+                        lw = self._ensure_writer("left_orig_writer",  "left_original",  f1)
+                        rw = self._ensure_writer("right_orig_writer", "right_original", f2)
+                        if lw and lw.isOpened(): lw.write(f1)
+                        if rw and rw.isOpened(): rw.write(f2)
                     pending_q.put((idx, f1, f2))
             except ConnectionError:
                 pass
@@ -316,6 +386,7 @@ class SegmentationServer:
                 inflight_sem.acquire()
                 with inflight_lock:
                     inflight_count += 1
+                # Send to both workers
                 self.in_queues[0].put((idx, f1))
                 self.in_queues[1].put((idx, f2))
                 dispatch_time[idx] = time.perf_counter()
@@ -346,6 +417,20 @@ class SegmentationServer:
                             ids1 = np.load(io.BytesIO(pair[0]), allow_pickle=False)
                             ids2 = np.load(io.BytesIO(pair[1]), allow_pickle=False)
 
+                            # Deterministic color map for processed videos
+                            if not hasattr(self, "cm"):
+                                rng = np.random.default_rng(42)
+                                self.cm = rng.integers(0, 255, size=(256, 3), dtype=np.uint8)
+
+                            # Save left/right processed videos (colorized class maps)
+                            if self.log_videos:
+                                arr1 = self.cm[ids1]
+                                arr2 = self.cm[ids2]
+                                lw = self._ensure_writer("left_proc_writer",  "left_processed",  arr1)
+                                rw = self._ensure_writer("right_proc_writer", "right_processed", arr2)
+                                if lw and lw.isOpened(): lw.write(arr1)
+                                if rw and rw.isOpened(): rw.write(arr2)
+
                             # BEV per side
                             bev_left  = npy_frame_to_bev(ids1, projector=self.projector_left,  grid=self.grid_left,  road_label=0)
                             bev_right = npy_frame_to_bev(ids2, projector=self.projector_right, grid=self.grid_right, road_label=0)
@@ -375,9 +460,12 @@ class SegmentationServer:
                                 blur_sigma=6.0
                             )
                             final_img = combine_viz_and_denoised(viz_img, denoised)
+                            if self.log_videos:
+                                pw = self._ensure_writer("post_writer", "postprocessed", final_img)
+                                if pw and pw.isOpened():
+                                    pw.write(final_img)
                             ok, jpg = cv2.imencode(".jpg", final_img, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
-                            out_bytes = jpg.tobytes() if ok : b""
-                            # Keep pair framing (send same viz twice)
+                            out_bytes = jpg.tobytes() if ok else b""
                             conn.sendall(struct.pack("!I", idx))
                             conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
                             conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
@@ -386,6 +474,21 @@ class SegmentationServer:
                             conn.sendall(struct.pack("!I", idx))
                             conn.sendall(struct.pack("!I", len(pair[0]))); conn.sendall(pair[0])
                             conn.sendall(struct.pack("!I", len(pair[1]))); conn.sendall(pair[1])
+                            # Logging processed images
+                            if self.log_videos and self.payload in ("ids", "jpg"):
+                                if self.payload == "jpg":
+                                    arr1 = cv2.imdecode(np.frombuffer(pair[0], np.uint8), cv2.IMREAD_COLOR)
+                                    arr2 = cv2.imdecode(np.frombuffer(pair[1], np.uint8), cv2.IMREAD_COLOR)
+                                else:
+                                    cm = np.random.randint(0,255,(256,3),dtype=np.uint8)
+                                    ids1 = np.load(io.BytesIO(pair[0]), allow_pickle=False)
+                                    ids2 = np.load(io.BytesIO(pair[1]), allow_pickle=False)
+                                    arr1 = cm[ids1]
+                                    arr2 = cm[ids2]
+                                lw = self._ensure_writer("left_proc_writer",  "left_processed",  arr1)
+                                rw = self._ensure_writer("right_proc_writer", "right_processed", arr2)
+                                if lw and lw.isOpened(): lw.write(arr1)
+                                if rw and rw.isOpened(): rw.write(arr2)
                     except (BrokenPipeError, ConnectionResetError):
                         logging.warning("Client disconnected during send (pair mode)")
                         break
@@ -417,6 +520,11 @@ class SegmentationServer:
         t_send = threading.Thread(target=send_thread, daemon=True)
         t_recv.start(); t_disp.start(); t_send.start()
         t_recv.join(); t_disp.join(); t_send.join()
+        if self.left_orig_writer: self.left_orig_writer.release()
+        if self.right_orig_writer: self.right_orig_writer.release()
+        if self.left_proc_writer: self.left_proc_writer.release()
+        if self.right_proc_writer: self.right_proc_writer.release()
+        if self.post_writer: self.post_writer.release()
 
     # ----------------- ASYNC single handler -----------------
     def _handle_single_async(self, conn: socket.socket):
@@ -425,25 +533,11 @@ class SegmentationServer:
         inflight_count = 0
         inflight_lock = threading.Lock()
         dispatch_time = {}
-
         pending_q: "queue.Queue[tuple[int,np.ndarray]]" = queue.Queue(maxsize=self.pair_queue_max)
-
-        def recv_thread():
-            try:
-                while True:
-                    idx = struct.unpack("!I", recv_exact(conn, 4))[0]
-                    s1 = struct.unpack("!I", recv_exact(conn, 4))[0]
-                    b1 = recv_exact(conn, s1)
-                    f = cv2.imdecode(np.frombuffer(b1, np.uint8), cv2.IMREAD_COLOR)
-                    if f is None:
-                        logging.warning("Decode failed for frame")
-                        break
-                    pending_q.put((idx, f))
-            except ConnectionError:
-                pass
-            finally:
-                stop_evt.set()
-
+        if self.log_videos:
+            orig_writer = proc_writer = post_writer = None
+        else:
+            orig_writer = proc_writer = post_writer = None
         def dispatch_thread():
             nonlocal inflight_count
             while not stop_evt.is_set() or not pending_q.empty():
@@ -456,7 +550,25 @@ class SegmentationServer:
                     inflight_count += 1
                 self.in_queues[0].put((idx, f))
                 dispatch_time[idx] = time.perf_counter()
-
+        def recv_thread():
+            try:
+                while True:
+                    idx = struct.unpack("!I", recv_exact(conn, 4))[0]
+                    s1 = struct.unpack("!I", recv_exact(conn, 4))[0]
+                    b1 = recv_exact(conn, s1)
+                    f = cv2.imdecode(np.frombuffer(b1, np.uint8), cv2.IMREAD_COLOR)
+                    if f is None:
+                        logging.warning("Decode failed for frame")
+                        break
+                    if self.log_videos:
+                        orig_writer = self._ensure_writer("orig_writer", "original_single", f)
+                        if orig_writer and orig_writer.isOpened():
+                            orig_writer.write(f)
+                    pending_q.put((idx, f))
+            except ConnectionError:
+                pass
+            finally:
+                stop_evt.set()
         def send_thread():
             nonlocal inflight_count
             while not stop_evt.is_set() or inflight_count>0:
@@ -472,6 +584,26 @@ class SegmentationServer:
                     # send immediately
                     conn.sendall(struct.pack("!I", idx))
                     conn.sendall(struct.pack("!I", len(data))); conn.sendall(data)
+                    if self.log_videos:
+                        if self.payload == "viz":
+                            arr = np.frombuffer(data, np.uint8)
+                            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                            post_writer = self._ensure_writer("post_writer", "postprocessed_single", img)
+                            if post_writer and post_writer.isOpened() and img is not None:
+                                post_writer.write(img)
+                        elif self.payload == "jpg":
+                            arr = np.frombuffer(data, np.uint8)
+                            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                            proc_writer = self._ensure_writer("proc_writer", "processed_single", img)
+                            if proc_writer and proc_writer.isOpened() and img is not None:
+                                proc_writer.write(img)
+                        elif self.payload == "ids":
+                            arr = np.load(io.BytesIO(data), allow_pickle=False)
+                            color_map = np.random.randint(0,255,(256,3),dtype=np.uint8)
+                            img = color_map[arr]
+                            proc_writer = self._ensure_writer("proc_writer", "processed_single", img)
+                            if proc_writer and proc_writer.isOpened():
+                                proc_writer.write(img)
                 except (BrokenPipeError, ConnectionResetError):
                     logging.warning("Client disconnected during send (single mode)")
                     break
@@ -490,6 +622,35 @@ class SegmentationServer:
         t_send = threading.Thread(target=send_thread, daemon=True)
         t_recv.start(); t_disp.start(); t_send.start()
         t_recv.join(); t_disp.join(); t_send.join()
+        if orig_writer: orig_writer.release()
+        if proc_writer: proc_writer.release()
+        if post_writer: post_writer.release()
+
+    def _get_video_writer(self, name, width, height):
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{name}_{now}.avi"
+        path = os.path.join(self.data_dir, filename)
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        wr = cv2.VideoWriter(path, fourcc, 20.0, (width, height))
+        if not wr.isOpened():
+            logging.warning(f"Failed to open VideoWriter for {filename} ({width}x{height})")
+        return wr, path
+
+    def _ensure_writer(self, attr_base: str, name: str, frame: np.ndarray):
+        """Create or recreate a writer to match the frame size."""
+        h, w = frame.shape[:2]
+        size_attr = attr_base + "_size"
+        writer_attr = attr_base
+        cur_size = getattr(self, size_attr, None)
+        writer = getattr(self, writer_attr, None)
+        if writer is None or (cur_size is not None and cur_size != (w, h)) or not writer.isOpened():
+            if writer is not None:
+                try: writer.release()
+                except: pass
+            writer, _ = self._get_video_writer(name, width=w, height=h)
+            setattr(self, writer_attr, writer)
+            setattr(self, size_attr, (w, h))
+        return writer
 
 # ------------------------------ Main ------------------------------
 def parse_args():
@@ -514,6 +675,12 @@ def parse_args():
                     help="What to send to the client. 'jpg' overlay, 'ids' label maps, or 'viz' final combined visualization.")
     ap.add_argument("--process-ids-stream", action="store_true",
                     help="With --process-ids, stream per-frame ID maps to one socket client instead of saving a single .npy.")
+    ap.add_argument("--flower-road-length", type=int, default=130, help="Length of detected road required to be considered valid street")
+    ap.add_argument("--flower-road-thickness", type=int, default=5, help="Thickness of detected road required to be considered valid street")
+    ap.add_argument("--flower-collision-length", type=int, default=60, help="Length of free space required to be considered valid for movement")
+    ap.add_argument("--flower-collision-thickness", type=int, default=5, help="Thickness of free space required to be considered valid for movement")
+    ap.add_argument("--log-videos", action="store_true",
+                    help="If set, saves original, processed (class), and postprocessed videos returned from client.")
     return ap.parse_args()
 # ------------------------------ Offline Processor ------------------------------
 def process_video_ids(model_path: str, input_video: str, output_npy: str, threads_per_worker: int):
@@ -607,24 +774,29 @@ def main():
     if args.process_ids:
         if not args.input_video or not args.output_npy:
             raise SystemExit("--process-ids requires --input-video and --output-npy")
-
         logging.info("Running in process-ids (offline) mode: no socket server will be started.")
         process_video_ids(
             model_path=args.model,
             input_video=args.input_video,
             output_npy=args.output_npy,
-            threads_per_worker=args.threads_per_worker,
-            payload=args.payload
+            threads_per_worker=args.threads_per_worker
         )
         return
 
     # Online mode: original socket server
     global BLEND_ALPHA
     BLEND_ALPHA = args.blend_alpha
-    srv = SegmentationServer(args.model, args.host, args.port, mode=args.mode,
-                             max_inflight=args.max_inflight, pair_queue_max=args.pair_queue_max,
-                             threads_per_worker=args.threads_per_worker, jpeg_quality=args.jpeg_quality,
-                             payload=args.payload)
+    srv = SegmentationServer(
+        args.model, args.host, args.port, mode=args.mode,
+        max_inflight=args.max_inflight, pair_queue_max=args.pair_queue_max,
+        threads_per_worker=args.threads_per_worker, jpeg_quality=args.jpeg_quality,
+        payload=args.payload,
+        flower_road_length=args.flower_road_length,
+        flower_road_thickness=args.flower_road_thickness,
+        flower_collision_length=args.flower_collision_length,
+        flower_collision_thickness=args.flower_collision_thickness,
+        log_videos=args.log_videos
+    )
     try:
         srv.serve()
     finally:
