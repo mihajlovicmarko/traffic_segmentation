@@ -1,0 +1,34 @@
+Solid Edge Translation To obj
+Date: Sunday,August 03,2025 02:50PM
+Output File: C:\Users\marko\Projekti\raspberry_kuciste_bajs\nosac_kamera\korekcija_ugla.obj
+Author: Unknown
+Organization: Unknown
+Source System: SOLID EDGE
+
+Hardware:
+Processor: AMD Ryzen 7 7840HS with Radeon 780M Graphics   
+Operating System: Windows 10
+Installed Memory: 13.69 GB
+
+Software Information:
+Parasolid Version: 36.0.142
+PSBodyshop Version: 36.0.108
+OBJ Adapter Version: 13.0.209
+Solid Edge Version: 224.00.00.101 x64
+
+OBJ Export Options:
+Export Construction Solids:Off
+Export Displayed Parts:Off
+Export Construction Sheets:Off
+Enable Logging:On
+Export Textures:Off
+Export Flatten Assembly:On
+Export Construction Solids and Sheets if design bodies not present:Off
+Export Units:Millimeters
+Export Tolerance Value:0.001000
+Export Tolerance Type:Fine
+Export Surface Plane Angle Value:0.523599
+
+Translation progress:
+Translation process completed
+Time required to translate:00 : 00 : 01
