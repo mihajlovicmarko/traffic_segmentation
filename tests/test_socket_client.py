@@ -104,16 +104,23 @@ def run_pair(args):
                         delay = time.time() - send_timestamps.pop(resp_idx)
                         logging.info(f"Frame {resp_idx} round-trip delay: {delay:.3f} sec")
 
-                    # Read header + two payloads (pair framing)
+                    # Read header + three payloads (pair framing in viz mode)
+                    # Server now sends: idx | len_left | left_seg | len_right | right_seg | len_final | final_viz
                     sz1 = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb1 = recv_exact(s, sz1)
+
                     sz2 = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb2 = recv_exact(s, sz2)
 
-                    # For payload == "viz", both rb1 and rb2 are identical JPGs.
-                    img = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
-                    if img is None:
-                        logging.error("Result decode failed")
+                    sz3 = struct.unpack('!I', recv_exact(s, 4))[0]
+                    rb3 = recv_exact(s, sz3)
+
+                    seg_left  = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
+                    seg_right = cv2.imdecode(np.frombuffer(rb2, np.uint8), cv2.IMREAD_COLOR)
+                    final_viz = cv2.imdecode(np.frombuffer(rb3, np.uint8), cv2.IMREAD_COLOR)
+
+                    if seg_left is None or seg_right is None or final_viz is None:
+                        logging.error("Result decode failed (one of seg_left/seg_right/final_viz).")
                         break
 
                     show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
@@ -121,14 +128,17 @@ def run_pair(args):
 
                     if show_live:
                         try:
-                            cv2.imshow("Road detection and following", img)
+                            cv2.imshow("Seg Left (preprocessed)", seg_left)
+                            cv2.imshow("Seg Right (preprocessed)", seg_right)
+                            cv2.imshow("Postprocessed (final)", final_viz)
                             if cv2.waitKey(1) & 0xFF == ord('q'):
                                 break
                         except cv2.error:
                             logging.warning("OpenCV built without GUI; disable --show or use xvfb-run.")
 
-                    if wri1: wri1.write(img)
-                    if wri2: wri2.write(img)  # both outputs get the same image
+                    # Optional: write only the final fused viz to outputs (as before)
+                    if wri1: wri1.write(final_viz)
+                    if wri2: wri2.write(final_viz)
 
                     inflight_sem.release()
                     frames_done += 1

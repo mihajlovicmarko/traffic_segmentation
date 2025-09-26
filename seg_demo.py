@@ -422,20 +422,21 @@ class SegmentationServer:
                                 rng = np.random.default_rng(42)
                                 self.cm = rng.integers(0, 255, size=(256, 3), dtype=np.uint8)
 
-                            # Save left/right processed videos (colorized class maps)
-                            if self.log_videos:
-                                arr1 = self.cm[ids1]
-                                arr2 = self.cm[ids2]
-                                lw = self._ensure_writer("left_proc_writer",  "left_processed",  arr1)
-                                rw = self._ensure_writer("right_proc_writer", "right_processed", arr2)
-                                if lw and lw.isOpened(): lw.write(arr1)
-                                if rw and rw.isOpened(): rw.write(arr2)
+                            # ---- Build "preprocessed" (segmented) color images (no overlay) ----
+                            seg_left_color  = self.cm[ids1]   # (H, W, 3) uint8
+                            seg_right_color = self.cm[ids2]   # (H, W, 3) uint8
 
-                            # BEV per side
+                            # Optional logging of the segmented (pre) frames
+                            if self.log_videos:
+                                lw = self._ensure_writer("left_proc_writer",  "left_processed",  seg_left_color)
+                                rw = self._ensure_writer("right_proc_writer", "right_processed", seg_right_color)
+                                if lw and lw.isOpened(): lw.write(seg_left_color)
+                                if rw and rw.isOpened(): rw.write(seg_right_color)
+
+                            # ---- BEV & postprocess to get final fused visualization ----
                             bev_left  = npy_frame_to_bev(ids1, projector=self.projector_left,  grid=self.grid_left,  road_label=0)
                             bev_right = npy_frame_to_bev(ids2, projector=self.projector_right, grid=self.grid_right, road_label=0)
 
-                            # Run post-processing
                             viz_img, denoised, self.proc_state, _ = process_two_bev_frames(
                                 bev_left, bev_right,
                                 self.flower_tensor_road, self.flower_tensor_collision,
@@ -460,15 +461,25 @@ class SegmentationServer:
                                 blur_sigma=6.0
                             )
                             final_img = combine_viz_and_denoised(viz_img, denoised)
+
                             if self.log_videos:
                                 pw = self._ensure_writer("post_writer", "postprocessed", final_img)
-                                if pw and pw.isOpened():
-                                    pw.write(final_img)
-                            ok, jpg = cv2.imencode(".jpg", final_img, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
-                            out_bytes = jpg.tobytes() if ok else b""
+                                if pw and pw.isOpened(): pw.write(final_img)
+
+                            # ---- Encode all three JPEGs ----
+                            okL, jpg_left  = cv2.imencode(".jpg", seg_left_color,  [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
+                            okR, jpg_right = cv2.imencode(".jpg", seg_right_color, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
+                            okF, jpg_final = cv2.imencode(".jpg", final_img,      [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
+
+                            left_bytes  = jpg_left.tobytes()  if okL else b""
+                            right_bytes = jpg_right.tobytes() if okR else b""
+                            final_bytes = jpg_final.tobytes() if okF else b""
+
+                            # ---- Send: idx | len_left | left | len_right | right | len_final | final ----
                             conn.sendall(struct.pack("!I", idx))
-                            conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
-                            conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
+                            conn.sendall(struct.pack("!I", len(left_bytes)));  conn.sendall(left_bytes)
+                            conn.sendall(struct.pack("!I", len(right_bytes))); conn.sendall(right_bytes)
+                            conn.sendall(struct.pack("!I", len(final_bytes))); conn.sendall(final_bytes)
                         else:
                             # Existing behavior (jpg overlays or raw ids)
                             conn.sendall(struct.pack("!I", idx))
