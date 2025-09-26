@@ -6,7 +6,9 @@ This project demonstrates real-time semantic segmentation of road scenes using O
 ## Features
 - **Fast, parallel inference** using OpenVINO Runtime and multiprocessing
 - **Socket server** for efficient frame exchange between client and server
-- **Supports paired video processing** (e.g., stereo or multi-camera)
+- **Supports paired or single video/camera processing**
+- **Multiple payload options:** overlay JPG, raw label maps (ids), or advanced visualization (viz)
+- **Optional logging of original, processed, and postprocessed videos**
 - **Easy integration** with your own video sources
 
 ## Project Structure
@@ -21,16 +23,6 @@ This project demonstrates real-time semantic segmentation of road scenes using O
 ├── test_videos/               # Example input videos
 ├── test_results/              # Output segmented videos
 ```
-## Start Notebook (develeopment)
-python3 -m notebook --allow-root \
-  --ServerApp.ip=0.0.0.0 \
-  --ServerApp.port=8888 \
-  --ServerApp.root_dir=/workspace \
-  --ServerApp.token='' --ServerApp.password=''
-
-
-
-
 ## Requirements
 
 - Python 3.8+
@@ -77,10 +69,17 @@ To run in **single mode** (process a single video stream, using all CPU cores):
 python seg_demo.py --mode single
 ```
 
-You can also override model, host, port, threads, and JPEG quality:
+#### Additional server options
+
+- `--payload` (jpg | ids | viz): Choose what to send to the client. Default is `jpg` (overlay). `ids` sends raw label maps. `viz` sends advanced visualization (BEV/postprocessed).
+- `--log-videos`: Save original, processed, and postprocessed videos to `collected_data/`.
+- `--threads-per-worker`, `--jpeg-quality`, `--max-inflight`, `--pair-queue-max`: Tune performance and quality.
+- `--blend-alpha`: Set overlay transparency (for jpg payload).
+
+Example:
 
 ```
-python seg_demo.py --mode pair --model <path_to_model.xml> --host 0.0.0.0 --port 5000 --threads-per-worker 4 --jpeg-quality 80
+python seg_demo.py --mode pair --payload viz --log-videos --threads-per-worker 4 --jpeg-quality 80
 ```
 
 ### 3. Run the Test Client
@@ -113,6 +112,18 @@ python tests/test_socket_client.py --mode single --single-source 1
 python tests/test_socket_client.py --mode single --camera1 0
 ```
 
+**Show live results (window):**
+
+Add `--show` to display processed frames in a window (works with camera or video).
+
+**Payload selection:**
+
+Add `--payload` (jpg | ids) to select what the client expects from the server. Must match the server's payload.
+
+**Other options:**
+- `--jpeg-quality`: Set JPEG quality for sending frames (default 40).
+- `--max-inflight`: Number of frames in flight (default 12).
+
 When using a camera, results are displayed live in a window. When using video files, results are saved in the `test_results/` directory by default.
 
 ## How It Works
@@ -123,12 +134,15 @@ When using a camera, results are displayed live in a window. When using video fi
     - In **pair mode**, two workers each process one video stream, each pinned to a separate set of CPU cores.
     - In **single mode**, one worker uses all available CPU cores for maximum throughput.
     - Listens for incoming socket connections and processes requests according to the selected mode.
+    - Supports multiple payload types: overlay JPG, raw label maps, or advanced visualization.
+    - Optionally logs original, processed, and postprocessed videos.
     - Logs detailed per-stage timings (preprocessing, inference, postprocessing, encoding) for each frame.
 
 2. **Client (`test_socket_client.py`)**
     - Reads one or two video files **or** live camera streams frame-by-frame.
-    - Sends frames to the server over a socket, matching the selected mode.
+    - Sends frames to the server over a socket, matching the selected mode and payload.
     - Receives segmented results and writes them to output videos (for video input) or displays them live (for camera input).
+    - Supports `--show` for live display, and `--payload` to match server output.
 
 ## Model
 
@@ -140,16 +154,18 @@ The default model is [semantic-segmentation-adas-0001](https://docs.openvino.ai/
 - **Change input videos:** Use `--video1` and `--video2` arguments for the client, or edit the defaults in `tests/test_socket_client.py`.
 - **Use a camera as input:** Use `--camera1` and/or `--camera2` to select camera indices (e.g., `--camera1 0`).
 - **Change model:** Use `--model` argument for the server, or edit `MODEL_PATH` in `seg_demo.py`.
-- **Tune performance:** Use `--threads-per-worker` and `--jpeg-quality` for the server, or edit the defaults in `seg_demo.py`.
+- **Tune performance:** Use `--threads-per-worker`, `--jpeg-quality`, `--max-inflight`, and `--pair-queue-max` for the server, or edit the defaults in `seg_demo.py`.
 - **Switch between single and pair mode:** Use `--mode single` or `--mode pair` for both server and client.
-
+- **Select payload type:** Use `--payload` (jpg, ids, viz) for the server and client.
+- **Enable video logging:** Use `--log-videos` on the server to save all video streams.
 
 ## Troubleshooting
 
 - **OpenVINO not found:** Make sure OpenVINO is installed and available in your Python environment.
-- **Socket connection errors:** Ensure the server is running before starting the client, and that both use the same `--mode`.
+- **Socket connection errors:** Ensure the server is running before starting the client, and that both use the same `--mode` and `--payload`.
 - **Video not found:** Check that the paths in `test_videos/` are correct and files exist, or use the `--video1`/`--video2` arguments.
 - **Performance:** In single mode, all CPU cores are used for maximum throughput. In pair mode, each worker is pinned to a separate set of cores for balanced parallelism. See server logs for detailed timing breakdowns.
+- **Live display not working:** If OpenCV is built without GUI support, use `--show` only in environments with display capability, or use `xvfb-run` for headless systems.
 
 ## License
 

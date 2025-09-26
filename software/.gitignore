@@ -1,11 +1,3 @@
-# Ignore image files
-*.png
-*.jpg
-*.jpeg
-*.bmp
-*.gif
-*.tiff
-*.webp
 
 # Ignore video files
 *.mp4
