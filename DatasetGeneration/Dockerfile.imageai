@@ -1,0 +1,52 @@
+# ---------- Base (CPU only) ----------
+FROM python:3.8-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git git-lfs wget ffmpeg ca-certificates \
+    build-essential libglib2.0-0 libsm6 libxext6 libxrender1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Enable Git LFS
+RUN git lfs install
+
+# Workspace
+WORKDIR /app
+
+# Clone the repo (shallow) and pull LFS (custom LP model)
+RUN git clone --depth 1 https://github.com/sotirismos/anonymization-pipeline.git \
+ && cd anonymization-pipeline && git lfs pull --include "yolov3_custom.h5"
+
+# Python deps (ImageAI + TF CPU + basics)
+# TF 2.4.x is compatible with many older ImageAI setups on CPU
+RUN pip install --upgrade pip \
+ && pip install \
+      tensorflow==2.4.4 \
+      imageai==2.1.6 \
+      opencv-python-headless \
+      numpy \
+      matplotlib \
+      h5py
+
+# Download MS COCO YOLO model (ImageAI expects this)
+WORKDIR /app/anonymization-pipeline/models
+# Download MS COCO YOLO model (ImageAI expects this)
+WORKDIR /app/anonymization-pipeline/models
+# replace wget with curl + retries
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* && \
+    bash -lc 'for i in 1 2 3 4 5; do \
+      curl -L --fail --retry 5 --retry-all-errors --connect-timeout 20 \
+        -o yolo.h5 https://github.com/OlafenwaMoses/ImageAI/releases/download/1.0/yolo.h5 && exit 0; \
+      echo "retry $i"; sleep 10; \
+    done; exit 1'
+
+# Back to repo root
+WORKDIR /app/anonymization-pipeline
+
+# Default: show help for the simple blur pipeline
+ENTRYPOINT ["python", "inference.py", "--help"]

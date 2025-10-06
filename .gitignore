@@ -1,0 +1,16 @@
+
+# Ignore video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.webm
+*.npy
+*.jpg
+*.jpeg
+*.gif
+*.tiff
+*.bmp
+*.svg

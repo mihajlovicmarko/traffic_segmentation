@@ -1,0 +1,8 @@
+# This file is used internally by FFMPEG.
+file 'file:/app/media/videos/example/480p15/partial_movie_files/PythagorasTensor/3104190716_4206040389_223132457.mp4'
+file 'file:/app/media/videos/example/480p15/partial_movie_files/PythagorasTensor/1654814317_1295445510_2506513299.mp4'
+file 'file:/app/media/videos/example/480p15/partial_movie_files/PythagorasTensor/1654814317_2844360058_4278369229.mp4'
+file 'file:/app/media/videos/example/480p15/partial_movie_files/PythagorasTensor/1654814317_3598538930_2245557501.mp4'
+file 'file:/app/media/videos/example/480p15/partial_movie_files/PythagorasTensor/1654814317_2552855209_2540222527.mp4'
+file 'file:/app/media/videos/example/480p15/partial_movie_files/PythagorasTensor/1654814317_1090629558_362973053.mp4'
+file 'file:/app/media/videos/example/480p15/partial_movie_files/PythagorasTensor/1654814317_2552855209_342575896.mp4'
