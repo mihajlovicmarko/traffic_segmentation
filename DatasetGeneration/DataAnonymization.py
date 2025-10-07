@@ -400,16 +400,24 @@ def main():
         rel = src.name if in_p.is_file() else src.relative_to(in_p)
         dst = out_p / rel
         ensure_dir(dst.parent)
+        # Determine output file path for images/videos
         if is_image(src):
-            anonymize_image(src, dst.with_suffix(".jpg") if dst.suffix.lower() in (".png",".bmp",".tif",".tiff",".webp") else dst,
-                            face_det, plate_det, args.blur, args.strength,
-                            face_conf=args.face_conf, plate_conf=args.plate_conf, plate_label=args.plate_label, tiles=args.tiles, enlarge=args.enlarge, plate_mode=plate_mode, debug=debug)
+            out_file = dst.with_suffix(".jpg") if dst.suffix.lower() in (".png",".bmp",".tif",".tiff",".webp") else dst
         elif is_video(src):
-            dst = dst.with_suffix(".mp4")
-            anonymize_video(src, dst, face_det, plate_det, args.blur, args.strength,
-                            face_conf=args.face_conf, plate_conf=args.plate_conf, plate_label=args.plate_label, tiles=args.tiles, enlarge=args.enlarge, plate_mode=plate_mode, debug=debug)
+            out_file = dst.with_suffix(".mp4")
         else:
             print(f"[SKIP] Unsupported file: {src}")
+            continue
+        # Skip if output file already exists
+        if out_file.exists():
+            print(f"[SKIP] Already processed: {out_file.name}")
+            continue
+        if is_image(src):
+            anonymize_image(src, out_file, face_det, plate_det, args.blur, args.strength,
+                            face_conf=args.face_conf, plate_conf=args.plate_conf, plate_label=args.plate_label, tiles=args.tiles, enlarge=args.enlarge, plate_mode=plate_mode, debug=debug)
+        elif is_video(src):
+            anonymize_video(src, out_file, face_det, plate_det, args.blur, args.strength,
+                            face_conf=args.face_conf, plate_conf=args.plate_conf, plate_label=args.plate_label, tiles=args.tiles, enlarge=args.enlarge, plate_mode=plate_mode, debug=debug)
     print("[DONE] Anonymization complete.")
 
 if __name__ == "__main__":
