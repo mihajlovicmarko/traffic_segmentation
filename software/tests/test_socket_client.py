@@ -4,10 +4,15 @@ import cv2, numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import sys
-sys.path.append('..')  # Add parent directory to path to import arducom
+import os
+# Add parent directory to Python path to import arducom
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, parent_dir)
+
 try:
     from arducom import ArduinoClient
     ARDUINO_AVAILABLE = True
+    logging.info("Arduino communication module loaded successfully")
 except ImportError as e:
     logging.warning(f"Arduino communication not available: {e}")
     ARDUINO_AVAILABLE = False
