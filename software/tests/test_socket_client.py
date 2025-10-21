@@ -149,6 +149,11 @@ def run_pair(args):
                                 logging.warning("Data was actually IDs, not JPEG - server/client payload mismatch!")
                             except:
                                 break
+                        elif args.payload == "viz":
+                            logging.info(f"Received BEV visualization frame {resp_idx}, size: {img.shape}")
+                            # Add title overlay for BEV frames
+                            cv2.putText(img, "Bird's Eye View - Road Detection", (10, 30), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
                     show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
                                 (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
@@ -305,7 +310,7 @@ def parse_args():
                 help="Display processed frames in a cv2 window")
     ap.add_argument("--frame-shape", nargs=2, type=int, default=[480, 640], metavar=("HEIGHT", "WIDTH"),
                 help="Frame shape as HEIGHT WIDTH (default: 480 640)")
-    ap.add_argument("--payload", choices=["jpg","ids"], default="jpg", help="Payload type: jpg (default) or ids (label map)")
+    ap.add_argument("--payload", choices=["jpg","ids","viz"], default="jpg", help="Payload type: jpg (default), ids (label map), or viz (BEV visualization)")
     return ap.parse_args()
 
 def main():
