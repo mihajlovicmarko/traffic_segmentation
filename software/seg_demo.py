@@ -277,7 +277,7 @@ class SegmentationServer:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((self.host, self.port))
             server.listen(1)
-            logging.info(f"Socket server listening on {self.host}:{self.port} ({self.mode} mode)")
+            logging.info(f"Socket server listening on {self.host}:{self.port} ({self.mode} mode, payload={self.payload})")
             while True:
                 conn, addr = server.accept()
                 logging.info(f"Connected by {addr}")

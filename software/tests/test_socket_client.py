@@ -110,11 +110,39 @@ def run_pair(args):
                     sz2 = struct.unpack('!I', recv_exact(s, 4))[0]
                     rb2 = recv_exact(s, sz2)
 
-                    # For payload == "viz", both rb1 and rb2 are identical JPGs.
-                    img = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
-                    if img is None:
-                        logging.error("Result decode failed")
-                        break
+                    # Handle different payload types
+                    logging.info(f"Received payload sizes: {sz1}, {sz2} bytes, expecting {args.payload}")
+                    
+                    if args.payload == "ids":
+                        # Decode numpy arrays and convert to colorized visualization
+                        try:
+                            import io
+                            ids = np.load(io.BytesIO(rb1), allow_pickle=False)
+                            # Create a simple colormap for visualization
+                            cm = np.random.randint(0, 255, (256, 3), dtype=np.uint8)
+                            img = cm[ids]
+                        except Exception as e:
+                            logging.error(f"Result decode failed (IDs): {e}")
+                            # Try as JPEG fallback
+                            img = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
+                            if img is not None:
+                                logging.warning("Data was actually JPEG, not IDs - server/client payload mismatch!")
+                            else:
+                                break
+                    else:
+                        # For payload == "jpg" or "viz", decode as JPEG
+                        img = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
+                        if img is None:
+                            logging.error(f"Result decode failed (JPEG) - data size: {sz1} bytes")
+                            # Try as numpy array fallback  
+                            try:
+                                import io
+                                ids = np.load(io.BytesIO(rb1), allow_pickle=False)
+                                cm = np.random.randint(0, 255, (256, 3), dtype=np.uint8)
+                                img = cm[ids]
+                                logging.warning("Data was actually IDs, not JPEG - server/client payload mismatch!")
+                            except:
+                                break
 
                     show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
                                 (hasattr(args, 'camera2') and args.camera2 is not None) or args.show

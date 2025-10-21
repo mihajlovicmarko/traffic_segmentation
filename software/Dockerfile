@@ -41,6 +41,7 @@ RUN pip install --no-cache-dir \
       scikit-learn \
       scikit-image \
       seaborn \
+      serial \
       tqdm && \
     pip check
 
