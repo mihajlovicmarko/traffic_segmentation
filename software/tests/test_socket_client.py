@@ -95,8 +95,14 @@ def run_pair(args):
             if True:
                 while True:
                     try:
+                        logging.info("Waiting for response...")
                         resp_idx = struct.unpack('!I', recv_exact(s, 4))[0]
+                        logging.info(f"Got response index: {resp_idx}")
                     except ConnectionError:
+                        logging.error("Connection lost")
+                        break
+                    except Exception as e:
+                        logging.error(f"Error receiving response: {e}")
                         break
 
                     # Log round-trip delay
@@ -117,18 +123,18 @@ def run_pair(args):
                         # Decode numpy arrays and convert to colorized visualization
                         try:
                             import io
+                            logging.info(f"Decoding IDs data, size: {len(rb1)} bytes")
                             ids = np.load(io.BytesIO(rb1), allow_pickle=False)
+                            logging.info(f"IDs array shape: {ids.shape}, dtype: {ids.dtype}")
                             # Create a simple colormap for visualization
+                            np.random.seed(42)  # Fixed seed for consistent colors
                             cm = np.random.randint(0, 255, (256, 3), dtype=np.uint8)
-                            img = cm[ids]
+                            cm[0] = [0, 0, 0]  # Background black
+                            img = cm[ids.astype(np.uint8)]
+                            logging.info(f"Created visualization image shape: {img.shape}")
                         except Exception as e:
                             logging.error(f"Result decode failed (IDs): {e}")
-                            # Try as JPEG fallback
-                            img = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
-                            if img is not None:
-                                logging.warning("Data was actually JPEG, not IDs - server/client payload mismatch!")
-                            else:
-                                break
+                            break
                     else:
                         # For payload == "jpg" or "viz", decode as JPEG
                         img = cv2.imdecode(np.frombuffer(rb1, np.uint8), cv2.IMREAD_COLOR)
