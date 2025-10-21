@@ -3,6 +3,14 @@ import os, time, socket, struct, logging, argparse
 import cv2, numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import sys
+sys.path.append('..')  # Add parent directory to path to import arducom
+try:
+    from arducom import ArduinoClient
+    ARDUINO_AVAILABLE = True
+except ImportError as e:
+    logging.warning(f"Arduino communication not available: {e}")
+    ARDUINO_AVAILABLE = False
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -37,6 +45,24 @@ def encode_jpg(img: np.ndarray, quality: int) -> bytes:
 
 # ----------------- async PAIR -----------------
 def run_pair(args):
+    # Initialize Arduino communication if requested
+    arduino = None
+    if args.arduino and ARDUINO_AVAILABLE:
+        try:
+            arduino = ArduinoClient(port=args.arduino_port)
+            arduino.connect()
+            logging.info(f"Arduino connected on port: {arduino.port}")
+            # Test connection
+            if arduino.ping():
+                logging.info("Arduino ping successful")
+            else:
+                logging.warning("Arduino ping failed")
+        except Exception as e:
+            logging.error(f"Failed to connect to Arduino: {e}")
+            arduino = None
+    elif args.arduino and not ARDUINO_AVAILABLE:
+        logging.error("Arduino communication requested but arducom module not available")
+
     # Select camera or video for each input
     src1 = args.camera1 if hasattr(args, 'camera1') and args.camera1 is not None else args.video1
     src2 = args.camera2 if hasattr(args, 'camera2') and args.camera2 is not None else args.video2
@@ -172,10 +198,18 @@ def run_pair(args):
                                 
                                 # Add detection info overlay on image
                                 y_offset = 60
+                                arduino_angle = None
+                                
                                 if road_rects:
                                     selected_road = next((r for r in road_rects if r.get("is_selected")), None)
                                     if selected_road:
-                                        text = f"Selected Road: {selected_road['angle_deg']:.1f}° (score: {selected_road['score']:.1f})"
+                                        # Convert angle from BEV coordinate system (180° to 0°) to steering angle
+                                        # BEV: 180° = full left, 90° = straight, 0° = full right
+                                        # Arduino: -90° = full left, 0° = straight, +90° = full right
+                                        bev_angle = selected_road['angle_deg']
+                                        arduino_angle = bev_angle - 90.0  # Convert to Arduino coordinate system
+                                        
+                                        text = f"Selected Road: {bev_angle:.1f}° → Arduino: {arduino_angle:.1f}° (score: {selected_road['score']:.1f})"
                                         cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                                         y_offset += 25
                                 
@@ -183,6 +217,19 @@ def run_pair(args):
                                     best_path = collision_rects[0]  # First one is typically the best
                                     text = f"Best Path: {best_path['angle_deg']:.1f}° (score: {best_path['score']:.1f})"
                                     cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                                
+                                # Send steering angle to Arduino
+                                if arduino_angle is not None and arduino is not None:
+                                    try:
+                                        success = arduino.set_angle(arduino_angle)
+                                        if success:
+                                            logging.info(f"Arduino: Set steering angle to {arduino_angle:.1f}°")
+                                        else:
+                                            logging.warning(f"Arduino: Failed to set angle {arduino_angle:.1f}°")
+                                    except Exception as e:
+                                        logging.error(f"Arduino communication error: {e}")
+                                elif arduino_angle is not None:
+                                    logging.info(f"Would set Arduino angle to {arduino_angle:.1f}° (Arduino not connected)")
                                 
                             except Exception as e:
                                 logging.error(f"Failed to parse detection data: {e}")
@@ -227,6 +274,15 @@ def run_pair(args):
     cap1.release(); cap2.release()
     if wri1: wri1.release()
     if wri2: wri2.release()
+    
+    # Close Arduino connection
+    if arduino is not None:
+        try:
+            arduino.close()
+            logging.info("Arduino connection closed")
+        except Exception as e:
+            logging.warning(f"Error closing Arduino connection: {e}")
+    
     logging.info("Done pair.")
     # Always destroy windows if live display was used
     if (hasattr(args, 'camera1') and args.camera1 is not None) or (hasattr(args, 'camera2') and args.camera2 is not None) or args.show:
@@ -347,6 +403,8 @@ def parse_args():
     ap.add_argument("--frame-shape", nargs=2, type=int, default=[480, 640], metavar=("HEIGHT", "WIDTH"),
                 help="Frame shape as HEIGHT WIDTH (default: 480 640)")
     ap.add_argument("--payload", choices=["jpg","ids","viz"], default="jpg", help="Payload type: jpg (default), ids (label map), or viz (BEV visualization)")
+    ap.add_argument("--arduino", action="store_true", help="Enable Arduino communication to send steering angles")
+    ap.add_argument("--arduino-port", default=None, help="Specific Arduino serial port (auto-detect if not specified)")
     return ap.parse_args()
 
 def main():
