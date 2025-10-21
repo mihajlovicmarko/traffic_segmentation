@@ -151,9 +151,45 @@ def run_pair(args):
                                 break
                         elif args.payload == "viz":
                             logging.info(f"Received BEV visualization frame {resp_idx}, size: {img.shape}")
+                            
+                            # The second payload contains detection data (JSON)
+                            try:
+                                import json
+                                detection_data = json.loads(rb2.decode('utf-8'))
+                                
+                                # Log detection information
+                                road_rects = detection_data.get("road_rectangles", [])
+                                collision_rects = detection_data.get("collision_rectangles", [])
+                                
+                                logging.info(f"Road rectangles detected: {len(road_rects)}")
+                                for rect in road_rects:
+                                    status = "SELECTED" if rect.get("is_selected") else "detected"
+                                    logging.info(f"  Road {status}: angle={rect['angle_deg']:.1f}°, score={rect['score']:.1f}")
+                                
+                                logging.info(f"Collision-free paths: {len(collision_rects)}")
+                                for rect in collision_rects:
+                                    logging.info(f"  Path: angle={rect['angle_deg']:.1f}°, score={rect['score']:.1f}")
+                                
+                                # Add detection info overlay on image
+                                y_offset = 60
+                                if road_rects:
+                                    selected_road = next((r for r in road_rects if r.get("is_selected")), None)
+                                    if selected_road:
+                                        text = f"Selected Road: {selected_road['angle_deg']:.1f}° (score: {selected_road['score']:.1f})"
+                                        cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                        y_offset += 25
+                                
+                                if collision_rects:
+                                    best_path = collision_rects[0]  # First one is typically the best
+                                    text = f"Best Path: {best_path['angle_deg']:.1f}° (score: {best_path['score']:.1f})"
+                                    cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                                
+                            except Exception as e:
+                                logging.error(f"Failed to parse detection data: {e}")
+                            
                             # Add title overlay for BEV frames
                             cv2.putText(img, "Bird's Eye View - Road Detection", (10, 30), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
                     show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
                                 (hasattr(args, 'camera2') and args.camera2 is not None) or args.show

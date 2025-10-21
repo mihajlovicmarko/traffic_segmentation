@@ -437,7 +437,7 @@ class SegmentationServer:
                             bev_right = npy_frame_to_bev(ids2, projector=self.projector_right, grid=self.grid_right, road_label=0)
 
                             # Run post-processing
-                            viz_img, denoised, self.proc_state, _ = process_two_bev_frames(
+                            viz_img, denoised, self.proc_state, result = process_two_bev_frames(
                                 bev_left, bev_right,
                                 self.flower_tensor_road, self.flower_tensor_collision,
                                 self.proc_state,
@@ -461,15 +461,68 @@ class SegmentationServer:
                                 blur_sigma=6.0
                             )
                             final_img = combine_viz_and_denoised(viz_img, denoised)
+                            
+                            # Extract detection data
+                            n_road = self.flower_tensor_road.shape[2]
+                            n_collision = self.flower_tensor_collision.shape[2]
+                            
+                            # Calculate angles for each rectangle index
+                            def calc_angle(i, n):
+                                return 180.0 - i * (180.0 / (n - 1)) if n > 1 else 180.0
+                            
+                            # Prepare detection data
+                            detection_data = {
+                                "road_rectangles": [],
+                                "collision_rectangles": []
+                            }
+                            
+                            # Road rectangles (large rectangles)
+                            road_scores = result.get("road_scores", np.array([]))
+                            best_road_idx = result.get("best_road_idx", -1)
+                            kept_indices = result.get("kept_indices", np.array([]))
+                            
+                            for i in kept_indices:
+                                angle = calc_angle(i, n_road)
+                                score = float(road_scores[i]) if i < len(road_scores) else 0.0
+                                is_selected = (i == best_road_idx)
+                                detection_data["road_rectangles"].append({
+                                    "index": int(i),
+                                    "angle_deg": angle,
+                                    "score": score,
+                                    "is_selected": is_selected
+                                })
+                            
+                            # Collision rectangles (small rectangles)
+                            small_scores = result.get("small_scores_biased", np.array([]))
+                            best_small_idxs = result.get("best_small_idxs", np.array([]))
+                            
+                            for i in best_small_idxs:
+                                angle = calc_angle(i, n_collision)
+                                score = float(small_scores[i]) if i < len(small_scores) else 0.0
+                                detection_data["collision_rectangles"].append({
+                                    "index": int(i),
+                                    "angle_deg": angle,
+                                    "score": score,
+                                    "is_best": True
+                                })
+                            
+                            # Serialize detection data as JSON
+                            import json
+                            detection_json = json.dumps(detection_data).encode('utf-8')
+                            
                             if self.log_videos:
                                 pw = self._ensure_writer("post_writer", "postprocessed", final_img)
                                 if pw and pw.isOpened():
                                     pw.write(final_img)
+                            
+                            # Encode BEV image
                             ok, jpg = cv2.imencode(".jpg", final_img, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
-                            out_bytes = jpg.tobytes() if ok else b""
+                            image_bytes = jpg.tobytes() if ok else b""
+                            
+                            # Send: idx | image_size | image_data | json_size | json_data | json_size | json_data (duplicate for pair protocol)
                             conn.sendall(struct.pack("!I", idx))
-                            conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
-                            conn.sendall(struct.pack("!I", len(out_bytes))); conn.sendall(out_bytes)
+                            conn.sendall(struct.pack("!I", len(image_bytes))); conn.sendall(image_bytes)
+                            conn.sendall(struct.pack("!I", len(detection_json))); conn.sendall(detection_json)
                         else:
                             # Existing behavior (jpg overlays or raw ids)
                             conn.sendall(struct.pack("!I", idx))
