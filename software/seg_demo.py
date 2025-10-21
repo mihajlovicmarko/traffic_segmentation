@@ -482,13 +482,13 @@ class SegmentationServer:
                             kept_indices = result.get("kept_indices", np.array([]))
                             
                             for i in kept_indices:
-                                angle = calc_angle(i, n_road)
+                                angle = calc_angle(int(i), n_road)
                                 score = float(road_scores[i]) if i < len(road_scores) else 0.0
-                                is_selected = (i == best_road_idx)
+                                is_selected = bool(i == best_road_idx)  # Convert to native bool
                                 detection_data["road_rectangles"].append({
                                     "index": int(i),
-                                    "angle_deg": angle,
-                                    "score": score,
+                                    "angle_deg": float(angle),
+                                    "score": float(score),
                                     "is_selected": is_selected
                                 })
                             
@@ -497,12 +497,12 @@ class SegmentationServer:
                             best_small_idxs = result.get("best_small_idxs", np.array([]))
                             
                             for i in best_small_idxs:
-                                angle = calc_angle(i, n_collision)
+                                angle = calc_angle(int(i), n_collision)
                                 score = float(small_scores[i]) if i < len(small_scores) else 0.0
                                 detection_data["collision_rectangles"].append({
                                     "index": int(i),
-                                    "angle_deg": angle,
-                                    "score": score,
+                                    "angle_deg": float(angle),
+                                    "score": float(score),
                                     "is_best": True
                                 })
                             
