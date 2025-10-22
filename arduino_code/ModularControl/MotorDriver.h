@@ -12,6 +12,7 @@ public:
 
   void begin();
   void applyControl(float u);
+  void setDirectPWM(uint8_t pwm, int dir = -1);  // Direct PWM control, dir=-1 keeps current
   uint8_t currentPwm() const { return curPwm_; }
   int currentDir() const { return curDir_; }
 

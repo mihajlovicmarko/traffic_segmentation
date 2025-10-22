@@ -3,12 +3,14 @@
 #include "PIDController.h"
 #include "AngleSensor.h"
 #include "MotorDriver.h"
+#include "SimpleMotor.h"
 #include "Protocol.h"
 #include "Trajectory.h"
 
 PIDController pid(KP, KI, KD);
 AngleSensor  sensor(A4, ANGLE_ALPHA);
-MotorDriver  motor(PWM_PIN, DIR_PIN, PWM_SLEW, DIR_HYST, DIR_MIN_HOLD_MS);
+MotorDriver  motor(PWM_PIN, DIR_PIN, PWM_SLEW, DIR_HYST, DIR_MIN_HOLD_MS);  // PID-controlled motor
+SimpleMotor  motor2(MOTOR2_PWM_PIN, MOTOR2_DIR_PIN);                       // Direct PWM motor
 Protocol     proto;
 
 static uint32_t last_loop_ms = 0;
@@ -17,10 +19,13 @@ static float set_angle = START_SET_ANGLE;
 void setup() {
   pinMode(PWM_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
+  pinMode(MOTOR2_PWM_PIN, OUTPUT);
+  pinMode(MOTOR2_DIR_PIN, OUTPUT);
   Serial.begin(SERIAL_BAUD);
   delay(50);                                     // let ADC settle
   sensor.init();
-  motor.begin();
+  motor.begin();    // PID motor
+  motor2.begin();   // Direct PWM motor
   proto.begin();
 
   last_loop_ms = millis();
@@ -40,9 +45,10 @@ void loop() {
         set_angle = constrain(cmd.value, -ANGLE_LIMIT, ANGLE_LIMIT);
         proto.ackOK("SET");
       } else if (cmd.type == Protocol::GET_STATE) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "ang=%.2f,pwm=%u,dir=%d",
-                 sensor.lastFiltered(), motor.currentPwm(), motor.currentDir());
+        char buf[80];
+        snprintf(buf, sizeof(buf), "ang=%.2f,m1_pwm=%u,m1_dir=%d,m2_pwm=%u,m2_dir=%d",
+                 sensor.lastFiltered(), motor.currentPwm(), motor.currentDir(),
+                 motor2.currentPwm(), motor2.currentDir());
         proto.ackOK(buf);
       } else if (cmd.type == Protocol::SET_KP) {
         pid.Kp = cmd.value; proto.ackOK("KP");
@@ -50,6 +56,14 @@ void loop() {
         pid.Ki = cmd.value; proto.ackOK("KI");
       } else if (cmd.type == Protocol::SET_KD) {
         pid.Kd = cmd.value; proto.ackOK("KD");
+      } else if (cmd.type == Protocol::SET_MOTOR_PWM) {
+        uint8_t pwm = constrain((int)cmd.value, 0, DIRECT_PWM_MAX);
+        motor.setDirectPWM(pwm);
+        proto.ackOK("M1_PWM");
+      } else if (cmd.type == Protocol::SET_MOTOR2_PWM) {
+        uint8_t pwm = constrain((int)cmd.value, 0, DIRECT_PWM_MAX);
+        motor2.setPWM(pwm);
+        proto.ackOK("M2_PWM");
       } else {
         proto.ackErr("UNKNOWN_CMD");
       }

@@ -10,6 +10,7 @@ Example Arduino commands expected:
 - SET_ANGLE,<deg>,
 - GET_STATE,
 - SET_KP,<val>,  SET_KI,<val>,  SET_KD,<val>,
+- SET_MOTOR_PWM,<pwm_value>,
 
 Example:
     from arducom import ArduinoClient
@@ -17,6 +18,7 @@ Example:
     cli.connect()
     cli.ping()
     cli.set_angle(20.0)
+    cli.set_motor_pwm(128)  # Set motor to half speed
     print(cli.get_state())
 """
 
@@ -197,6 +199,17 @@ class ArduinoClient:
 
     def set_kd(self, kd: float) -> bool:
         res = self.request(f"SET_KD,{kd:.6f},")
+        return res.get("status") == "OK"
+
+    def set_motor_pwm(self, pwm_value: int) -> bool:
+        """
+        Set PWM value for the main motor.
+        pwm_value: PWM value (typically 0-255, but depends on Arduino implementation)
+        """
+        # Clamp PWM value to valid range (0-255 for 8-bit PWM)
+        if pwm_value < 0: pwm_value = 0
+        if pwm_value > 255: pwm_value = 255
+        res = self.request(f"SET_MOTOR_PWM,{pwm_value},")
         return res.get("status") == "OK"
 
     def get_state(self) -> Dict[str, str]:

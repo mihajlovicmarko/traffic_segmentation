@@ -37,3 +37,18 @@ void MotorDriver::applyControl(float u) {
   curPwm_ = slew(target, curPwm_, slew_);
   analogWrite(pwm_, curPwm_);
 }
+
+void MotorDriver::setDirectPWM(uint8_t pwm, int dir) {
+  uint32_t now = millis();
+  
+  // Set direction if specified
+  if (dir >= 0 && dir != curDir_ && (now - lastDirChange_) >= minHoldMs_) {
+    curDir_ = dir;
+    lastDirChange_ = now;
+    digitalWrite(dir_, curDir_);
+  }
+  
+  // Set PWM directly (with slew limiting for safety)
+  curPwm_ = slew(pwm, curPwm_, slew_);
+  analogWrite(pwm_, curPwm_);
+}

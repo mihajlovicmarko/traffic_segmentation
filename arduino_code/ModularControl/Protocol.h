@@ -12,7 +12,7 @@ namespace ProtocolUtil {
 
 class Protocol {
 public:
-  enum CmdType { NONE, PING, SET_ANGLE, GET_STATE, SET_KP, SET_KI, SET_KD };
+  enum CmdType { NONE, PING, SET_ANGLE, GET_STATE, SET_KP, SET_KI, SET_KD, SET_MOTOR_PWM, SET_MOTOR2_PWM };
 
   struct Cmd {
     CmdType type = NONE;

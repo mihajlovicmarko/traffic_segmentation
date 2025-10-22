@@ -91,10 +91,12 @@ bool Protocol::parseLineToCmd(const String& s, Cmd& out) {
     val = num.toFloat();
   }
 
-  if (cmd == "SET_ANGLE") { out.type = SET_ANGLE; out.value = val; return true; }
-  if (cmd == "SET_KP")    { out.type = SET_KP;    out.value = val; return true; }
-  if (cmd == "SET_KI")    { out.type = SET_KI;    out.value = val; return true; }
-  if (cmd == "SET_KD")    { out.type = SET_KD;    out.value = val; return true; }
+  if (cmd == "SET_ANGLE")      { out.type = SET_ANGLE;      out.value = val; return true; }
+  if (cmd == "SET_KP")         { out.type = SET_KP;         out.value = val; return true; }
+  if (cmd == "SET_KI")         { out.type = SET_KI;         out.value = val; return true; }
+  if (cmd == "SET_KD")         { out.type = SET_KD;         out.value = val; return true; }
+  if (cmd == "SET_MOTOR_PWM")  { out.type = SET_MOTOR_PWM;  out.value = val; return true; }
+  if (cmd == "SET_MOTOR2_PWM") { out.type = SET_MOTOR2_PWM; out.value = val; return true; }
 
   return false;
 }
