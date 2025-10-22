@@ -172,30 +172,13 @@ def run_pair(args):
 
 
 
-    # Initialize display windows with positioning
+    # Determine if we should show live display
     show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
                 (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
     
     if show_live:
-        try:
-            # Create windows and position them
-            cv2.namedWindow("Bird's Eye View - Road Detection", cv2.WINDOW_NORMAL)
-            cv2.namedWindow("Camera 1 - Original", cv2.WINDOW_NORMAL)
-            cv2.namedWindow("Camera 2 - Original", cv2.WINDOW_NORMAL)
-            cv2.namedWindow("Combined Camera View", cv2.WINDOW_NORMAL)
-            
-            # Position windows (approximate positioning)
-            cv2.moveWindow("Bird's Eye View - Road Detection", 50, 50)
-            cv2.moveWindow("Camera 1 - Original", 650, 50)
-            cv2.moveWindow("Camera 2 - Original", 650, 350)
-            cv2.moveWindow("Combined Camera View", 50, 450)
-            
-            logging.info("Display windows initialized")
-            logging.info("Controls: Press 'q' in any window to quit")
-            logging.info("Windows: BEV (top-left), Camera 1 (top-right), Camera 2 (mid-right), Combined (bottom-left)")
-        except cv2.error:
-            logging.warning("Could not initialize display windows")
-            show_live = False
+        logging.info("Live display enabled - windows will appear when processing starts")
+        logging.info("Controls: Press 'q' in any window to quit")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, ThreadPoolExecutor(max_workers=2) as pool:
         s.connect((args.host, args.port))
@@ -236,6 +219,8 @@ def run_pair(args):
             frames_done = 0
             last_time = time.time() 
             state = None   
+            windows_initialized = False
+            
             if True:
                 while True:
                     try:
@@ -381,6 +366,22 @@ def run_pair(args):
 
                     if show_live:
                         try:
+                            # Initialize windows on first frame
+                            if not windows_initialized:
+                                cv2.namedWindow("Bird's Eye View - Road Detection", cv2.WINDOW_NORMAL)
+                                cv2.namedWindow("Camera 1 - Original", cv2.WINDOW_NORMAL) 
+                                cv2.namedWindow("Camera 2 - Original", cv2.WINDOW_NORMAL)
+                                cv2.namedWindow("Combined Camera View", cv2.WINDOW_NORMAL)
+                                
+                                # Position windows
+                                cv2.moveWindow("Bird's Eye View - Road Detection", 50, 50)
+                                cv2.moveWindow("Camera 1 - Original", 650, 50)
+                                cv2.moveWindow("Camera 2 - Original", 650, 350)
+                                cv2.moveWindow("Combined Camera View", 50, 450)
+                                
+                                windows_initialized = True
+                                logging.info("Display windows created and positioned")
+                            
                             # Add frame counter to BEV display
                             bev_display = img.copy()
                             cv2.putText(bev_display, f"Frame: {resp_idx}", (img.shape[1] - 150, 30), 
@@ -389,7 +390,7 @@ def run_pair(args):
                             # Display BEV visualization
                             cv2.imshow("Bird's Eye View - Road Detection", bev_display)
                             
-                            # Display original camera frames in parallel
+                            # Display original camera frames in parallel if available
                             if hasattr(sender, 'latest_frames') and sender.latest_frames and len(sender.latest_frames) == 2:
                                 f1_display, f2_display = sender.latest_frames
                                 
