@@ -112,6 +112,11 @@ python tests/test_socket_client.py --mode single --single-source 1
 python tests/test_socket_client.py --mode single --camera1 0
 ```
 
+**Example With Driving enabled**
+```
+python3 tests/test_socket_client.py --mode pair --host 192.168.1.67 --port 5000 --video1 ~/projekti/bajs_vizija/recordings/cam1_1754590241.mp4 --video2 ~/projekti/bajs_vizija//recordings/cam2_1754590241.mp4 --max-inflight 4 --payload viz --show --arduino --arduino-port /dev/ttyUSB0  --collision-threshold 0.4 --driving-pwm-max 100 --enable-driving
+```
+
 **Show live results (window):**
 
 Add `--show` to display processed frames in a window (works with camera or video).

@@ -1,4 +1,20 @@
 # client_async.py
+"""
+Autonomous vehicle client with multi-window display and Arduino integration.
+
+Display Windows:
+- Bird's Eye View: Road detection and navigation visualization (top-left)
+- Camera 1 Original: Raw input from first camera (top-right)
+- Camera 2 Original: Raw input from second camera (middle-right)
+- Combined View: Side-by-side camera feeds with status info (bottom-left)
+
+Controls:
+- Press 'q' in any window to quit
+
+Example usage:
+python test_socket_client.py --arduino --enable-driving --show --payload viz
+python test_socket_client.py --arduino --camera1 0 --camera2 1 --payload viz --show  # Live cameras
+"""
 import os, time, socket, struct, logging, argparse
 import cv2, numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -156,6 +172,31 @@ def run_pair(args):
 
 
 
+    # Initialize display windows with positioning
+    show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
+                (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
+    
+    if show_live:
+        try:
+            # Create windows and position them
+            cv2.namedWindow("Bird's Eye View - Road Detection", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Camera 1 - Original", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Camera 2 - Original", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Combined Camera View", cv2.WINDOW_NORMAL)
+            
+            # Position windows (approximate positioning)
+            cv2.moveWindow("Bird's Eye View - Road Detection", 50, 50)
+            cv2.moveWindow("Camera 1 - Original", 650, 50)
+            cv2.moveWindow("Camera 2 - Original", 650, 350)
+            cv2.moveWindow("Combined Camera View", 50, 450)
+            
+            logging.info("Display windows initialized")
+            logging.info("Controls: Press 'q' in any window to quit")
+            logging.info("Windows: BEV (top-left), Camera 1 (top-right), Camera 2 (mid-right), Combined (bottom-left)")
+        except cv2.error:
+            logging.warning("Could not initialize display windows")
+            show_live = False
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, ThreadPoolExecutor(max_workers=2) as pool:
         s.connect((args.host, args.port))
         logging.info(f"Connected to server {args.host}:{args.port} (pair mode, max_inflight={args.max_inflight})")
@@ -171,6 +212,12 @@ def run_pair(args):
                     frame_sent += 1
                     idx = frame_sent
                     send_timestamps[idx] = time.time()
+
+                    # Store original frames for parallel display
+                    if hasattr(sender, 'latest_frames'):
+                        sender.latest_frames = (f1.copy(), f2.copy())
+                    else:
+                        sender.latest_frames = (f1.copy(), f2.copy())
 
                     # parallel JPEG for small boost
                     fut1 = pool.submit(encode_jpg, f1, args.jpeg_quality)
@@ -332,12 +379,76 @@ def run_pair(args):
                             cv2.putText(img, "Bird's Eye View - Road Detection", (10, 30), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                    show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
-                                (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
-
                     if show_live:
                         try:
-                            cv2.imshow("Road detection and following", img)
+                            # Add frame counter to BEV display
+                            bev_display = img.copy()
+                            cv2.putText(bev_display, f"Frame: {resp_idx}", (img.shape[1] - 150, 30), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            
+                            # Display BEV visualization
+                            cv2.imshow("Bird's Eye View - Road Detection", bev_display)
+                            
+                            # Display original camera frames in parallel
+                            if hasattr(sender, 'latest_frames') and sender.latest_frames and len(sender.latest_frames) == 2:
+                                f1_display, f2_display = sender.latest_frames
+                                
+                                # Add labels and frame info to original frames
+                                f1_labeled = f1_display.copy()
+                                f2_labeled = f2_display.copy()
+                                
+                                cv2.putText(f1_labeled, "Camera 1 - Input", (10, 30), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                                cv2.putText(f1_labeled, f"Frame: {resp_idx}", (10, 60), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                
+                                cv2.putText(f2_labeled, "Camera 2 - Input", (10, 30), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                                cv2.putText(f2_labeled, f"Frame: {resp_idx}", (10, 60), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                
+                                # Add Arduino status if available
+                                if arduino is not None:
+                                    status_text = "Arduino: Connected"
+                                    color = (0, 255, 0)
+                                else:
+                                    status_text = "Arduino: Disconnected"
+                                    color = (0, 0, 255)
+                                
+                                cv2.putText(f1_labeled, status_text, (10, f1_labeled.shape[0] - 20), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                                cv2.putText(f2_labeled, status_text, (10, f2_labeled.shape[0] - 20), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                                
+                                # Display original frames
+                                cv2.imshow("Camera 1 - Original", f1_labeled)
+                                cv2.imshow("Camera 2 - Original", f2_labeled)
+                                
+                                # Create a combined view of both cameras
+                                # Resize frames to fit side by side
+                                h1, w1 = f1_display.shape[:2]
+                                h2, w2 = f2_display.shape[:2]
+                                target_height = 240  # Smaller size for combined view
+                                scale1 = target_height / h1
+                                scale2 = target_height / h2
+                                
+                                f1_resized = cv2.resize(f1_display, (int(w1 * scale1), target_height))
+                                f2_resized = cv2.resize(f2_display, (int(w2 * scale2), target_height))
+                                
+                                # Combine horizontally
+                                combined = np.hstack([f1_resized, f2_resized])
+                                
+                                # Add info overlay to combined view
+                                cv2.putText(combined, f"Dual Camera Feed - Frame {resp_idx}", (10, 25), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                
+                                # Add processing status
+                                fps_text = f"Processing FPS: {frames_done / (time.time() - start):.1f}" if frames_done > 0 else "Processing..."
+                                cv2.putText(combined, fps_text, (10, combined.shape[0] - 10), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                                
+                                cv2.imshow("Combined Camera View", combined)
+                            
                             if cv2.waitKey(1) & 0xFF == ord('q'):
                                 break
                         except cv2.error:
@@ -383,8 +494,9 @@ def run_pair(args):
     
     logging.info("Done pair.")
     # Always destroy windows if live display was used
-    if (hasattr(args, 'camera1') and args.camera1 is not None) or (hasattr(args, 'camera2') and args.camera2 is not None) or args.show:
+    if show_live:
         cv2.destroyAllWindows()
+        logging.info("Display windows closed")
 
 
 # ----------------- async SINGLE -----------------
