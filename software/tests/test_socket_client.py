@@ -48,6 +48,64 @@ def encode_jpg(img: np.ndarray, quality: int) -> bytes:
     if not ok: raise RuntimeError("JPEG encode failed")
     return buf.tobytes()
 
+def calculate_driving_speed(detection_data, args):
+    """
+    Calculate driving motor PWM based on road detection and collision avoidance.
+    
+    Args:
+        detection_data: Dict containing road_rectangles and collision_rectangles
+        args: Command line arguments with thresholds and PWM limits
+    
+    Returns:
+        int: PWM value for driving motor (0 = stop)
+    """
+    road_rects = detection_data.get("road_rectangles", [])
+    collision_rects = detection_data.get("collision_rectangles", [])
+    
+    # Safety first: Check for collision-free paths
+    if not collision_rects:
+        logging.warning("No collision-free paths detected - stopping")
+        return 0
+    
+    # Get the best collision-free path (first in sorted list)
+    best_collision_path = collision_rects[0]
+    collision_score = best_collision_path.get("score", 0.0)
+    
+    # Check collision threshold
+    if collision_score < args.collision_threshold:
+        logging.info(f"Collision score {collision_score:.2f} below threshold {args.collision_threshold:.2f} - stopping")
+        return 0
+    
+    # Get road detection score
+    road_score = 0.0
+    if road_rects:
+        selected_road = next((r for r in road_rects if r.get("is_selected")), None)
+        if selected_road:
+            road_score = selected_road.get("score", 0.0)
+        else:
+            # Use best road if none selected
+            road_score = max(r.get("score", 0.0) for r in road_rects)
+    
+    # Check minimum road score
+    if road_score < args.road_score_min:
+        logging.info(f"Road score {road_score:.2f} below minimum {args.road_score_min:.2f} - stopping")
+        return 0
+    
+    # Calculate PWM based on road score and collision safety
+    # Combine road score and collision score for speed calculation
+    combined_score = (road_score + collision_score) / 2.0
+    
+    # Map combined score to PWM range
+    pwm_range = args.driving_pwm_max - args.driving_pwm_min
+    pwm = args.driving_pwm_min + int(combined_score * pwm_range)
+    
+    # Clamp to valid range
+    pwm = max(args.driving_pwm_min, min(args.driving_pwm_max, pwm))
+    
+    logging.info(f"Driving calculation: road={road_score:.2f}, collision={collision_score:.2f}, combined={combined_score:.2f}, PWM={pwm}")
+    
+    return pwm
+
 # ----------------- async PAIR -----------------
 def run_pair(args):
     # Initialize Arduino communication if requested
@@ -60,6 +118,14 @@ def run_pair(args):
             # Test connection
             if arduino.ping():
                 logging.info("Arduino ping successful")
+                
+                # Initialize driving motor to stopped state if driving is enabled
+                if args.enable_driving:
+                    success = arduino.set_motor2_pwm(0)
+                    if success:
+                        logging.info("Arduino: Initialized driving motor to stopped state")
+                    else:
+                        logging.warning("Arduino: Failed to initialize driving motor")
             else:
                 logging.warning("Arduino ping failed")
         except Exception as e:
@@ -236,6 +302,29 @@ def run_pair(args):
                                 elif arduino_angle is not None:
                                     logging.info(f"Would set Arduino angle to {arduino_angle:.1f}° (Arduino not connected)")
                                 
+                                # Calculate and send driving speed
+                                if args.enable_driving and arduino is not None:
+                                    try:
+                                        driving_pwm = calculate_driving_speed(detection_data, args)
+                                        success = arduino.set_motor2_pwm(driving_pwm)
+                                        if success:
+                                            logging.info(f"Arduino: Set driving speed to PWM {driving_pwm}")
+                                        else:
+                                            logging.warning(f"Arduino: Failed to set driving speed {driving_pwm}")
+                                        
+                                        # Add driving info to display
+                                        y_offset += 25
+                                        status_text = "DRIVING" if driving_pwm > 0 else "STOPPED"
+                                        color = (0, 255, 0) if driving_pwm > 0 else (0, 0, 255)
+                                        text = f"Driving: {status_text} (PWM: {driving_pwm})"
+                                        cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                                        
+                                    except Exception as e:
+                                        logging.error(f"Arduino driving control error: {e}")
+                                elif args.enable_driving:
+                                    driving_pwm = calculate_driving_speed(detection_data, args)
+                                    logging.info(f"Would set Arduino driving speed to PWM {driving_pwm} (Arduino not connected)")
+                                
                             except Exception as e:
                                 logging.error(f"Failed to parse detection data: {e}")
                             
@@ -283,6 +372,10 @@ def run_pair(args):
     # Close Arduino connection
     if arduino is not None:
         try:
+            # Stop driving motor before closing connection
+            if args.enable_driving:
+                arduino.set_motor2_pwm(0)
+                logging.info("Arduino: Emergency stop - driving motor stopped")
             arduino.close()
             logging.info("Arduino connection closed")
         except Exception as e:
@@ -410,6 +503,13 @@ def parse_args():
     ap.add_argument("--payload", choices=["jpg","ids","viz"], default="jpg", help="Payload type: jpg (default), ids (label map), or viz (BEV visualization)")
     ap.add_argument("--arduino", action="store_true", help="Enable Arduino communication to send steering angles")
     ap.add_argument("--arduino-port", default=None, help="Specific Arduino serial port (auto-detect if not specified)")
+    
+    # Driving motor control parameters
+    ap.add_argument("--collision-threshold", type=float, default=0.3, help="Minimum collision score to enable driving (0.0-1.0)")
+    ap.add_argument("--road-score-min", type=float, default=0.2, help="Minimum road score to move")
+    ap.add_argument("--driving-pwm-min", type=int, default=30, help="Minimum PWM for driving motor")
+    ap.add_argument("--driving-pwm-max", type=int, default=120, help="Maximum PWM for driving motor")
+    ap.add_argument("--enable-driving", action="store_true", help="Enable automatic driving motor control")
     return ap.parse_args()
 
 def main():

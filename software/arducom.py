@@ -212,6 +212,17 @@ class ArduinoClient:
         res = self.request(f"SET_MOTOR_PWM,{pwm_value},")
         return res.get("status") == "OK"
 
+    def set_motor2_pwm(self, pwm_value: int) -> bool:
+        """
+        Set PWM value for the second motor (driving motor).
+        pwm_value: PWM value (typically 0-255, but depends on Arduino implementation)
+        """
+        # Clamp PWM value to valid range (0-255 for 8-bit PWM)
+        if pwm_value < 0: pwm_value = 0
+        if pwm_value > 255: pwm_value = 255
+        res = self.request(f"SET_MOTOR2_PWM,{pwm_value},")
+        return res.get("status") == "OK"
+
     def get_state(self) -> Dict[str, str]:
         """Returns dict parsed from info (e.g., {'ang':'12.3','pwm':'110','dir':'0', ...})."""
         res = self.request("GET_STATE,")
