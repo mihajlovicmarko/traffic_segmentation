@@ -15,6 +15,7 @@ Protocol     proto;
 
 static uint32_t last_loop_ms = 0;
 static float set_angle = START_SET_ANGLE;
+static float filtered_set_angle = START_SET_ANGLE;
 
 void setup() {
   pinMode(PWM_PIN, OUTPUT);
@@ -42,7 +43,8 @@ void loop() {
       if (cmd.type == Protocol::PING) {
         proto.ackOK("PONG");
       } else if (cmd.type == Protocol::SET_ANGLE) {
-        set_angle = constrain(cmd.value, -ANGLE_LIMIT, ANGLE_LIMIT);
+        float new_set_angle = constrain(cmd.value, -ANGLE_LIMIT, ANGLE_LIMIT);
+        set_angle = SET_ANGLE_ALPHA * new_set_angle + (1.0f - SET_ANGLE_ALPHA) * set_angle;
         proto.ackOK("SET");
       } else if (cmd.type == Protocol::GET_STATE) {
         char buf[80];

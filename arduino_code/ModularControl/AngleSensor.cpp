@@ -17,8 +17,7 @@ float AngleSensor::readDeg() {
   if (u > 0.99f) u = 0.99f;
   if (u < 0.01f) u = 0.01f;
   float angle = mapRawToDeg(u);
-  filt_ = alpha_ * angle + (1.0f - alpha_) * filt_;
-  return filt_;
+  return angle;
 }
 
 // Your mapping

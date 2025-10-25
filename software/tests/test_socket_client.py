@@ -9,9 +9,17 @@ Display Windows:
 Controls:
 - Press 'q' in any window to quit
 
+Features:
+- Real-time road detection and collision avoidance
+- Arduino-based steering and driving control
+- Advanced obstacle avoidance with scanning and path selection
+- Configurable PWM control for motors
+- Live visualization of detection results
+
 Example usage:
 python test_socket_client.py --arduino --enable-driving --show --payload viz
 python test_socket_client.py --arduino --camera1 0 --camera2 1 --payload viz --show  # Live cameras
+python test_socket_client.py --arduino --enable-driving --enable-obstacle-avoidance --show --payload viz  # With obstacle avoidance
 """
 import os, time, socket, struct, logging, argparse
 import cv2, numpy as np
@@ -19,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import sys
 import os
+from enum import Enum
 # Add parent directory to Python path to import arducom
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
@@ -33,6 +42,240 @@ except ImportError as e:
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+class ObstacleAvoidanceState(Enum):
+    NORMAL = "normal"
+    OBSTACLE_DETECTED = "obstacle_detected"
+    REVERSING = "reversing"
+    SCANNING_LEFT = "scanning_left"
+    SCANNING_RIGHT = "scanning_right"
+    TURNING_TO_BEST = "turning_to_best"
+
+class ObstacleAvoidanceController:
+    """
+    Advanced obstacle avoidance controller with scanning and best path selection.
+    """
+    def __init__(self, args):
+        self.enabled = args.enable_obstacle_avoidance
+        self.collision_timeout = args.obstacle_collision_timeout
+        self.reverse_max_pwm = args.obstacle_reverse_max_pwm
+        self.scan_angle = args.obstacle_scan_angle
+        self.scan_speed = args.obstacle_scan_speed
+        self.path_weight = args.obstacle_path_weight
+        
+        # State tracking
+        self.state = ObstacleAvoidanceState.NORMAL
+        self.collision_start_time = None
+        self.last_collision_time = None
+        self.reverse_start_time = None
+        self.scan_start_time = None
+        self.current_angle = 0.0
+        self.scan_start_angle = 0.0
+        self.best_angle = 0.0
+        self.best_score = 0.0
+        self.scan_data = {}  # angle -> (road_score, collision_score, combined_score)
+        
+        logging.info(f"Obstacle avoidance initialized: enabled={self.enabled}")
+        if self.enabled:
+            logging.info(f"  Collision timeout: {self.collision_timeout}s")
+            logging.info(f"  Reverse max PWM: {self.reverse_max_pwm}")
+            logging.info(f"  Scan angle: ±{self.scan_angle}°")
+            logging.info(f"  Scan speed: {self.scan_speed}°/s")
+            logging.info(f"  Path weight: {self.path_weight}")
+    
+    def update(self, detection_data, arduino, current_time):
+        """
+        Update obstacle avoidance state and return control commands.
+        Returns: (should_override_normal_control, steering_angle, driving_pwm)
+        """
+        if not self.enabled:
+            return False, None, None
+            
+        collision_rects = detection_data.get("collision_rectangles", [])
+        road_rects = detection_data.get("road_rectangles", [])
+        
+        # Check if we have collision-free paths
+        has_collision_free_path = len(collision_rects) > 0
+        
+        if has_collision_free_path:
+            self.last_collision_time = None
+            if self.state != ObstacleAvoidanceState.NORMAL:
+                logging.info("Obstacle avoidance: Collision-free path found, returning to normal")
+                self.state = ObstacleAvoidanceState.NORMAL
+                self._reset_state()
+            return False, None, None
+        else:
+            # No collision-free paths available
+            if self.last_collision_time is None:
+                self.last_collision_time = current_time
+                self.collision_start_time = current_time
+                logging.info("Obstacle avoidance: No collision-free paths detected")
+            
+            # Check if we've been without collision-free paths for too long
+            collision_duration = current_time - self.collision_start_time
+            if collision_duration >= self.collision_timeout:
+                if self.state == ObstacleAvoidanceState.NORMAL:
+                    logging.info("Obstacle avoidance: Activating obstacle avoidance sequence")
+                    self.state = ObstacleAvoidanceState.REVERSING
+                    self.reverse_start_time = current_time
+                
+                return self._handle_obstacle_avoidance(detection_data, arduino, current_time)
+        
+        return False, None, None
+    
+    def _handle_obstacle_avoidance(self, detection_data, arduino, current_time):
+        """Handle the obstacle avoidance state machine."""
+        
+        if self.state == ObstacleAvoidanceState.REVERSING:
+            return self._handle_reversing(current_time)
+        
+        elif self.state == ObstacleAvoidanceState.SCANNING_LEFT:
+            return self._handle_scanning_left(detection_data, arduino, current_time)
+        
+        elif self.state == ObstacleAvoidanceState.SCANNING_RIGHT:
+            return self._handle_scanning_right(detection_data, arduino, current_time)
+        
+        elif self.state == ObstacleAvoidanceState.TURNING_TO_BEST:
+            return self._handle_turning_to_best(detection_data, arduino, current_time)
+        
+        return False, None, None
+    
+    def _handle_reversing(self, current_time):
+        """Handle reversing state with gradually increasing power."""
+        reverse_duration = current_time - self.reverse_start_time
+        
+        # Gradually increase reverse power up to max
+        reverse_progress = min(1.0, reverse_duration / 2.0)  # 2 seconds to reach max
+        reverse_pwm = int(-self.reverse_max_pwm * reverse_progress)  # Negative for reverse
+        
+        logging.info(f"Obstacle avoidance: Reversing at PWM {abs(reverse_pwm)} (progress: {reverse_progress:.1%})")
+        
+        # After 3 seconds of reversing, start scanning
+        if reverse_duration >= 3.0:
+            logging.info("Obstacle avoidance: Starting left scan")
+            self.state = ObstacleAvoidanceState.SCANNING_LEFT
+            self.scan_start_time = current_time
+            self.scan_start_angle = self.current_angle
+            self.scan_data = {}
+            return True, self.current_angle, 0  # Stop driving
+        
+        return True, self.current_angle, reverse_pwm
+    
+    def _handle_scanning_left(self, detection_data, arduino, current_time):
+        """Handle scanning left to find best path."""
+        scan_duration = current_time - self.scan_start_time
+        
+        # Calculate target angle (scan left from starting position)
+        angle_progress = scan_duration * self.scan_speed
+        target_angle = self.scan_start_angle - min(angle_progress, self.scan_angle)
+        
+        # Record current position's scores
+        self._record_scan_data(target_angle, detection_data)
+        
+        # Check if we've completed the left scan
+        if angle_progress >= self.scan_angle:
+            logging.info("Obstacle avoidance: Starting right scan")
+            self.state = ObstacleAvoidanceState.SCANNING_RIGHT
+            self.scan_start_time = current_time
+            return True, target_angle, 0
+        
+        return True, target_angle, 0
+    
+    def _handle_scanning_right(self, detection_data, arduino, current_time):
+        """Handle scanning right to find best path."""
+        scan_duration = current_time - self.scan_start_time
+        
+        # Calculate target angle (scan right from starting position)
+        angle_progress = scan_duration * self.scan_speed
+        target_angle = self.scan_start_angle + min(angle_progress, self.scan_angle)
+        
+        # Record current position's scores
+        self._record_scan_data(target_angle, detection_data)
+        
+        # Check if we've completed the right scan
+        if angle_progress >= self.scan_angle:
+            # Find best angle from scan data
+            self._find_best_angle()
+            logging.info(f"Obstacle avoidance: Scan complete, turning to best angle: {self.best_angle:.1f}° (score: {self.best_score:.3f})")
+            self.state = ObstacleAvoidanceState.TURNING_TO_BEST
+            self.scan_start_time = current_time
+            return True, target_angle, 0
+        
+        return True, target_angle, 0
+    
+    def _handle_turning_to_best(self, detection_data, arduino, current_time):
+        """Handle turning to the best found angle."""
+        # Check if we have collision-free paths at current angle
+        collision_rects = detection_data.get("collision_rectangles", [])
+        if len(collision_rects) > 0:
+            logging.info("Obstacle avoidance: Collision-free path found during turn, returning to normal")
+            self.state = ObstacleAvoidanceState.NORMAL
+            self._reset_state()
+            return False, None, None
+        
+        # Continue turning towards best angle
+        angle_diff = self.best_angle - self.current_angle
+        if abs(angle_diff) > 2.0:  # 2 degree tolerance
+            # Turn slowly towards best angle
+            turn_speed = self.scan_speed * 0.5  # Half speed for final approach
+            turn_direction = 1 if angle_diff > 0 else -1
+            target_angle = self.current_angle + turn_direction * turn_speed * 0.1  # 0.1s time step
+            
+            return True, target_angle, 0
+        else:
+            # Reached target angle, wait for collision-free path
+            logging.info("Obstacle avoidance: Reached best angle, waiting for collision-free path")
+            return True, self.best_angle, 0
+    
+    def _record_scan_data(self, angle, detection_data):
+        """Record scan data for current angle."""
+        road_rects = detection_data.get("road_rectangles", [])
+        collision_rects = detection_data.get("collision_rectangles", [])
+        
+        # Calculate road score
+        road_score = max((r.get("score", 0.0) for r in road_rects), default=0.0)
+        
+        # Calculate collision score
+        collision_score = max((c.get("score", 0.0) for c in collision_rects), default=0.0)
+        
+        # Combined score with weighting
+        combined_score = road_score + self.path_weight * collision_score
+        
+        self.scan_data[angle] = (road_score, collision_score, combined_score)
+        
+        logging.info(f"Obstacle avoidance: Scan at {angle:.1f}° - road: {road_score:.3f}, collision: {collision_score:.3f}, combined: {combined_score:.3f}")
+    
+    def _find_best_angle(self):
+        """Find the best angle from scan data."""
+        if not self.scan_data:
+            self.best_angle = self.scan_start_angle
+            self.best_score = 0.0
+            return
+        
+        # Find angle with highest combined score
+        best_angle, (road_score, collision_score, combined_score) = max(
+            self.scan_data.items(),
+            key=lambda item: item[1][2]  # Sort by combined score
+        )
+        
+        self.best_angle = best_angle
+        self.best_score = combined_score
+        
+        logging.info(f"Obstacle avoidance: Best angle found: {best_angle:.1f}° with score {combined_score:.3f}")
+    
+    def _reset_state(self):
+        """Reset state variables."""
+        self.collision_start_time = None
+        self.last_collision_time = None
+        self.reverse_start_time = None
+        self.scan_start_time = None
+        self.scan_data = {}
+        self.best_angle = 0.0
+        self.best_score = 0.0
+    
+    def update_current_angle(self, angle):
+        """Update the current steering angle."""
+        self.current_angle = angle
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = b""
@@ -62,22 +305,30 @@ def encode_jpg(img: np.ndarray, quality: int) -> bytes:
     if not ok: raise RuntimeError("JPEG encode failed")
     return buf.tobytes()
 
-def calculate_driving_speed(detection_data, args):
+def calculate_driving_speed(detection_data, args, obstacle_controller=None):
     """
     Calculate driving motor PWM based on road detection and collision avoidance.
     
     Args:
         detection_data: Dict containing road_rectangles and collision_rectangles
         args: Command line arguments with thresholds and PWM limits
+        obstacle_controller: Optional obstacle avoidance controller
     
     Returns:
-        int: PWM value for driving motor (0 = stop)
+        int: PWM value for driving motor (0 = stop, negative = reverse)
     """
     road_rects = detection_data.get("road_rectangles", [])
     collision_rects = detection_data.get("collision_rectangles", [])
     
     # Safety first: Check for collision-free paths
     if not collision_rects:
+        # Check if obstacle avoidance should handle this
+        if obstacle_controller and obstacle_controller.enabled:
+            current_time = time.time()
+            should_override, _, driving_pwm = obstacle_controller.update(detection_data, None, current_time)
+            if should_override and driving_pwm is not None:
+                return driving_pwm
+        
         logging.warning("No collision-free paths detected - stopping")
         return 0
     
@@ -122,6 +373,9 @@ def calculate_driving_speed(detection_data, args):
 
 # ----------------- async PAIR -----------------
 def run_pair(args):
+    # Initialize obstacle avoidance controller
+    obstacle_controller = ObstacleAvoidanceController(args)
+    
     # Initialize Arduino communication if requested
     arduino = None
     if args.arduino and ARDUINO_AVAILABLE:
@@ -319,41 +573,97 @@ def run_pair(args):
                                     text = f"Best Path: {best_path['angle_deg']:.1f}° (score: {best_path['score']:.1f})"
                                     cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                                 
+                                # Check for obstacle avoidance override first
+                                obstacle_override = False
+                                final_arduino_angle = arduino_angle
+                                final_driving_pwm = None
+                                
+                                if obstacle_controller.enabled:
+                                    current_time = time.time()
+                                    should_override, override_angle, override_pwm = obstacle_controller.update(detection_data, arduino, current_time)
+                                    
+                                    if should_override:
+                                        obstacle_override = True
+                                        if override_angle is not None:
+                                            final_arduino_angle = override_angle
+                                        if override_pwm is not None:
+                                            final_driving_pwm = override_pwm
+                                        
+                                        # Update obstacle controller with current angle
+                                        if final_arduino_angle is not None:
+                                            obstacle_controller.update_current_angle(final_arduino_angle)
+                                        
+                                        # Add obstacle avoidance status to display
+                                        y_offset += 25
+                                        state_text = f"Obstacle Avoidance: {obstacle_controller.state.value.upper()}"
+                                        cv2.putText(img, state_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                                
                                 # Send steering angle to Arduino
-                                if arduino_angle is not None and arduino is not None:
+                                if final_arduino_angle is not None and arduino is not None:
                                     try:
-                                        success = arduino.set_angle(arduino_angle)
+                                        success = arduino.set_angle(final_arduino_angle)
                                         if success:
-                                            logging.info(f"Arduino: Set steering angle to {arduino_angle:.1f}°")
+                                            status = "OBSTACLE AVOIDANCE" if obstacle_override else "NORMAL"
+                                            logging.info(f"Arduino: Set steering angle to {final_arduino_angle:.1f}° ({status})")
                                         else:
-                                            logging.warning(f"Arduino: Failed to set angle {arduino_angle:.1f}°")
+                                            logging.warning(f"Arduino: Failed to set angle {final_arduino_angle:.1f}°")
                                     except Exception as e:
                                         logging.error(f"Arduino communication error: {e}")
-                                elif arduino_angle is not None:
-                                    logging.info(f"Would set Arduino angle to {arduino_angle:.1f}° (Arduino not connected)")
+                                elif final_arduino_angle is not None:
+                                    status = "OBSTACLE AVOIDANCE" if obstacle_override else "NORMAL"
+                                    logging.info(f"Would set Arduino angle to {final_arduino_angle:.1f}° ({status}) (Arduino not connected)")
                                 
                                 # Calculate and send driving speed
                                 if args.enable_driving and arduino is not None:
                                     try:
-                                        driving_pwm = calculate_driving_speed(detection_data, args)
-                                        success = arduino.set_motor2_pwm(driving_pwm)
-                                        if success:
-                                            logging.info(f"Arduino: Set driving speed to PWM {driving_pwm}")
+                                        if obstacle_override and final_driving_pwm is not None:
+                                            driving_pwm = final_driving_pwm
                                         else:
-                                            logging.warning(f"Arduino: Failed to set driving speed {driving_pwm}")
+                                            driving_pwm = calculate_driving_speed(detection_data, args, obstacle_controller)
+                                        
+                                        # Handle reverse PWM (negative values)
+                                        if driving_pwm < 0:
+                                            # For reverse, we might need to use a different Arduino command
+                                            # For now, we'll use absolute value and log the reverse intent
+                                            abs_pwm = abs(driving_pwm)
+                                            success = arduino.set_motor2_pwm(abs_pwm)  # Use absolute value for now
+                                            if success:
+                                                logging.info(f"Arduino: Set REVERSE driving speed to PWM {abs_pwm} (original: {driving_pwm})")
+                                            else:
+                                                logging.warning(f"Arduino: Failed to set reverse driving speed {abs_pwm}")
+                                        else:
+                                            success = arduino.set_motor2_pwm(driving_pwm)
+                                            if success:
+                                                logging.info(f"Arduino: Set driving speed to PWM {driving_pwm}")
+                                            else:
+                                                logging.warning(f"Arduino: Failed to set driving speed {driving_pwm}")
                                         
                                         # Add driving info to display
                                         y_offset += 25
-                                        status_text = "DRIVING" if driving_pwm > 0 else "STOPPED"
-                                        color = (0, 255, 0) if driving_pwm > 0 else (0, 0, 255)
-                                        text = f"Driving: {status_text} (PWM: {driving_pwm})"
+                                        if driving_pwm < 0:
+                                            status_text = "REVERSING"
+                                            color = (0, 255, 255)  # Yellow for reverse
+                                        elif driving_pwm > 0:
+                                            status_text = "DRIVING"
+                                            color = (0, 255, 0)  # Green for forward
+                                        else:
+                                            status_text = "STOPPED"
+                                            color = (0, 0, 255)  # Red for stopped
+                                        
+                                        mode = "OBSTACLE" if obstacle_override else "NORMAL"
+                                        text = f"Driving: {status_text} (PWM: {abs(driving_pwm)}) [{mode}]"
                                         cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                                         
                                     except Exception as e:
                                         logging.error(f"Arduino driving control error: {e}")
                                 elif args.enable_driving:
-                                    driving_pwm = calculate_driving_speed(detection_data, args)
-                                    logging.info(f"Would set Arduino driving speed to PWM {driving_pwm} (Arduino not connected)")
+                                    if obstacle_override and final_driving_pwm is not None:
+                                        driving_pwm = final_driving_pwm
+                                    else:
+                                        driving_pwm = calculate_driving_speed(detection_data, args, obstacle_controller)
+                                    
+                                    mode = "OBSTACLE" if obstacle_override else "NORMAL"
+                                    logging.info(f"Would set Arduino driving speed to PWM {driving_pwm} [{mode}] (Arduino not connected)")
                                 
                             except Exception as e:
                                 logging.error(f"Failed to parse detection data: {e}")
@@ -549,7 +859,7 @@ def run_single(args):
                     img = cv2.imdecode(np.frombuffer(rb, np.uint8), cv2.IMREAD_COLOR)
                     if img is None: break
                     # Always show if using camera, or if --show is set
-                    show_live = use_camera or args.show
+                    show_live = args.show
                     if show_live:
                         cv2.imshow("Processed Video", img)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -607,6 +917,21 @@ def parse_args():
     ap.add_argument("--driving-pwm-min", type=int, default=30, help="Minimum PWM for driving motor")
     ap.add_argument("--driving-pwm-max", type=int, default=120, help="Maximum PWM for driving motor")
     ap.add_argument("--enable-driving", action="store_true", help="Enable automatic driving motor control")
+    
+    # Obstacle avoidance parameters
+    ap.add_argument("--enable-obstacle-avoidance", action="store_true", 
+                   help="Enable advanced obstacle avoidance with scanning and path selection")
+    ap.add_argument("--obstacle-collision-timeout", type=float, default=2.0,
+                   help="Time (seconds) without collision-free paths before activating obstacle avoidance (default: 2.0)")
+    ap.add_argument("--obstacle-reverse-max-pwm", type=int, default=35,
+                   help="Maximum PWM for reversing during obstacle avoidance (default: 35)")
+    ap.add_argument("--obstacle-scan-angle", type=float, default=45.0,
+                   help="Scan angle range in degrees (±degrees from center) (default: 45.0)")
+    ap.add_argument("--obstacle-scan-speed", type=float, default=30.0,
+                   help="Scanning speed in degrees per second (default: 30.0)")
+    ap.add_argument("--obstacle-path-weight", type=float, default=0.7,
+                   help="Weight coefficient for collision-free path score vs road score (default: 0.7)")
+    
     return ap.parse_args()
 
 def main():

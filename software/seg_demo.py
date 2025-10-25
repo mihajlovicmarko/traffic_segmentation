@@ -194,6 +194,8 @@ class SegmentationServer:
                  jpeg_quality=JPEG_QUALITY, payload="jpg",
                  flower_road_length=130, flower_road_thickness=5,
                  flower_collision_length=60, flower_collision_thickness=5,
+                 road_min_abs=40.0, road_min_frac_of_max=0.10,
+                 collision_min_abs=300.0, collision_min_frac_of_max=0.30,
                  log_videos=False):
         self.host, self.port, self.mode = host, port, mode
         self.max_inflight = int(max_inflight)
@@ -201,6 +203,10 @@ class SegmentationServer:
         self.threads_per_worker = int(threads_per_worker)
         self.jpeg_quality = int(jpeg_quality)
         self.payload = payload
+        self.road_min_abs = float(road_min_abs)
+        self.road_min_frac_of_max = float(road_min_frac_of_max)
+        self.collision_min_abs = float(collision_min_abs)
+        self.collision_min_frac_of_max = float(collision_min_frac_of_max)
         self.log_videos = log_videos
         self.data_dir = os.path.join(os.getcwd(), "collected_data")
         if self.log_videos:
@@ -448,10 +454,10 @@ class SegmentationServer:
                                 remembrance=8.0,
                                 residual_sigma=16.0,
                                 convergent_with_road=5.0,
-                                road_min_abs=40,
-                                road_min_frac_of_max=0.10,
-                                collision_min_abs=300,
-                                collision_min_frac_of_max=0.30,
+                                road_min_abs=self.road_min_abs,
+                                road_min_frac_of_max=self.road_min_frac_of_max,
+                                collision_min_abs=self.collision_min_abs,
+                                collision_min_frac_of_max=self.collision_min_frac_of_max,
                                 small_top_k=1,
                                 road_color=(100,255,100),
                                 selected_road_color=(0,255,255),
@@ -733,6 +739,10 @@ def parse_args():
     ap.add_argument("--flower-road-thickness", type=int, default=5, help="Thickness of detected road required to be considered valid street")
     ap.add_argument("--flower-collision-length", type=int, default=60, help="Length of free space required to be considered valid for movement")
     ap.add_argument("--flower-collision-thickness", type=int, default=5, help="Thickness of free space required to be considered valid for movement")
+    ap.add_argument("--road-min-abs", type=float, default=40.0, help="Minimum absolute threshold for road detection")
+    ap.add_argument("--road-min-frac-of-max", type=float, default=0.10, help="Minimum fraction of maximum road score required for detection")
+    ap.add_argument("--collision-min-abs", type=float, default=300.0, help="Minimum absolute threshold for collision detection")
+    ap.add_argument("--collision-min-frac-of-max", type=float, default=0.30, help="Minimum fraction of maximum collision score required for detection")
     ap.add_argument("--log-videos", action="store_true",
                     help="If set, saves original, processed (class), and postprocessed videos returned from client.")
     return ap.parse_args()
@@ -849,6 +859,10 @@ def main():
         flower_road_thickness=args.flower_road_thickness,
         flower_collision_length=args.flower_collision_length,
         flower_collision_thickness=args.flower_collision_thickness,
+        road_min_abs=args.road_min_abs,
+        road_min_frac_of_max=args.road_min_frac_of_max,
+        collision_min_abs=args.collision_min_abs,
+        collision_min_frac_of_max=args.collision_min_frac_of_max,
         log_videos=args.log_videos
     )
     try:
