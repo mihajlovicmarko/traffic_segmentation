@@ -425,8 +425,7 @@ def run_pair(args):
 
 
     # Determine if we should show live display
-    show_live = (hasattr(args, 'camera1') and args.camera1 is not None) or \
-                (hasattr(args, 'camera2') and args.camera2 is not None) or args.show
+    show_live =  args.show
     
     if show_live:
         logging.info("Live display enabled - BEV and Combined Camera windows will appear when processing starts")
