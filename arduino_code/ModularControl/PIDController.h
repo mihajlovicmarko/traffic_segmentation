@@ -8,6 +8,6 @@ struct PIDController {
   float i_sum = 0.0f;
 
   PIDController(float kp, float ki, float kd) : Kp(kp), Ki(ki), Kd(kd) {}
-  PID_Errors compute(float setpoint, float measured, float dt);
+  PID_Errors compute(float setpoint, float dt);
   void reset() { last_error = 0.0f; i_sum = 0.0f; }
 };

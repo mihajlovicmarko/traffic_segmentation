@@ -31,7 +31,9 @@ void setup() {
 
   last_loop_ms = millis();
 }
-
+inline int sgn(float val) {
+  return (val > 0) - (val < 0);
+}
 void loop() {
   // Fixed-rate loop
   uint32_t now = millis();
@@ -74,6 +76,8 @@ void loop() {
   }
   last_loop_ms += LOOP_DT_MS;
 
+
+
   // Optional: generate a trajectory on the target (can disable in Config.h)
 #if ENABLE_TRAJECTORY
   set_angle = trajectory(now);
@@ -81,13 +85,37 @@ void loop() {
 
   // Read sensor
   float angle = sensor.readDeg();
+  
 
   // PID compute (fixed dt)
-  PID_Errors e = pid.compute(set_angle, angle, LOOP_DT);
+  PID_Errors e = pid.compute(set_angle, LOOP_DT);
 
   // Control output -> direction + PWM
-  float u = e.u;                            // from PIDController
-  motor.applyControl(u);
+  float set_angle = trajectory(millis()); // example, or fixed setpoint
+
+  //float u = abs(set_angle - angle) * sgn(set_angle);  // desired direction
+  float u = e.u;
+  // Limit behavior: only allow control if movement brings us toward 0°
+  const float ANGLE_LIMIT = 30.0f;
+
+  if (angle > ANGLE_LIMIT) {
+    // Too far in + direction → only allow movement back (negative torque)
+    if (u < 0)
+      motor.applyControl(u);
+    else
+      motor.applyControl(0);
+  } 
+  else if (angle < -ANGLE_LIMIT) {
+    // Too far in - direction → only allow movement back (positive torque)
+    if (u > 0)
+      motor.applyControl(u);
+    else
+      motor.applyControl(0);
+  } 
+  else {
+    // Safe range → normal control
+    motor.applyControl(u);
+  }
 
   // (Optional) lightweight debug each 200 ms
 #if LIGHT_DEBUG

@@ -19,13 +19,13 @@ static const uint32_t LOOP_DT_MS = 1000UL / LOOP_HZ;
 static const float    LOOP_DT    = 1.0f / LOOP_HZ;
 
 // --- Control gains (defaults; tunable via protocol) ---
-static const float KP = 3.0f;
-static const float KI = 0.0f;
+static const float KP = 1.0f;
+static const float KI = 0.005f;
 static const float KD = 0.005f;
 
 // --- Filtering / smoothing ---
 static const float ANGLE_ALPHA = 0.15f;   // 0..1 EMA
-static const float SET_ANGLE_ALPHA = 0.3f;  // 0..1 EMA for desired angle commands
+static const float SET_ANGLE_ALPHA = 0.1f;  // 0..1 EMA for desired angle commands
 static const float DIR_HYST = 2.0f;       // degrees of deadband
 static const uint16_t DIR_MIN_HOLD_MS = 50;
 static const uint8_t PWM_SLEW = 4;        // PWM change per loop

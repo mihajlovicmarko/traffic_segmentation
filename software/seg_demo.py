@@ -735,14 +735,17 @@ def parse_args():
                     help="What to send to the client. 'jpg' overlay, 'ids' label maps, or 'viz' final combined visualization.")
     ap.add_argument("--process-ids-stream", action="store_true",
                     help="With --process-ids, stream per-frame ID maps to one socket client instead of saving a single .npy.")
+    
     ap.add_argument("--flower-road-length", type=int, default=130, help="Length of detected road required to be considered valid street")
     ap.add_argument("--flower-road-thickness", type=int, default=5, help="Thickness of detected road required to be considered valid street")
     ap.add_argument("--flower-collision-length", type=int, default=60, help="Length of free space required to be considered valid for movement")
     ap.add_argument("--flower-collision-thickness", type=int, default=5, help="Thickness of free space required to be considered valid for movement")
+    
     ap.add_argument("--road-min-abs", type=float, default=40.0, help="Minimum absolute threshold for road detection")
     ap.add_argument("--road-min-frac-of-max", type=float, default=0.10, help="Minimum fraction of maximum road score required for detection")
     ap.add_argument("--collision-min-abs", type=float, default=300.0, help="Minimum absolute threshold for collision detection")
-    ap.add_argument("--collision-min-frac-of-max", type=float, default=0.30, help="Minimum fraction of maximum collision score required for detection")
+    ap.add_argument("--collision-min-frac-of-max", type=float, default=0.50, help="Minimum fraction of maximum collision score required for detection")
+    
     ap.add_argument("--log-videos", action="store_true",
                     help="If set, saves original, processed (class), and postprocessed videos returned from client.")
     return ap.parse_args()
