@@ -8,11 +8,13 @@ Display Windows:
 
 Controls:
 - Press 'q' in any window to quit
+- Manual Control Mode: Arrow keys (↑=forward, ↓=reverse, ←=left, →=right), 's'=stop, 'q'=quit
 
 Features:
 - Real-time road detection and collision avoidance
 - Arduino-based steering and driving control
 - Advanced obstacle avoidance with scanning and path selection
+- Manual keyboard control (game-like arrow key controls)
 - Configurable PWM control for motors
 - Live visualization of detection results
 
@@ -20,6 +22,8 @@ Example usage:
 python test_socket_client.py --arduino --enable-driving --show --payload viz
 python test_socket_client.py --arduino --camera1 0 --camera2 1 --payload viz --show  # Live cameras
 python test_socket_client.py --arduino --enable-driving --enable-obstacle-avoidance --show --payload viz  # With obstacle avoidance
+python test_socket_client.py --arduino --enable-manual-control --show --payload viz  # Manual control with arrow keys
+python test_socket_client.py --arduino --enable-manual-control --manual-max-pwm 80 --manual-angle-step 10 --show --payload viz  # Custom manual settings
 """
 import os, time, socket, struct, logging, argparse
 import cv2, numpy as np
@@ -28,6 +32,14 @@ import threading
 import sys
 import os
 from enum import Enum
+
+# Platform-specific imports for keyboard handling
+if sys.platform == 'win32':
+    import msvcrt
+else:
+    import select
+    import tty
+    import termios
 # Add parent directory to Python path to import arducom
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
@@ -42,6 +54,166 @@ except ImportError as e:
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+class ManualControlState:
+    """
+    Manual keyboard control state for bike/vehicle control.
+    Arrow keys control steering and driving like in a game.
+    """
+    def __init__(self, args):
+        self.enabled = args.enable_manual_control
+        self.max_angle = args.manual_max_angle
+        self.angle_step = args.manual_angle_step
+        self.max_pwm = args.manual_max_pwm
+        self.pwm_step = args.manual_pwm_step
+        
+        # Current control state
+        self.current_angle = 0.0
+        self.current_pwm = 0
+        self.keys_pressed = set()
+        
+        # Control thread
+        self.control_thread = None
+        self.running = False
+        
+        if self.enabled:
+            logging.info(f"Manual control enabled:")
+            logging.info(f"  Max steering angle: ±{self.max_angle}°")
+            logging.info(f"  Angle step: {self.angle_step}°")
+            logging.info(f"  Max PWM: {self.max_pwm}")
+            logging.info(f"  PWM step: {self.pwm_step}")
+            logging.info("  Controls: Arrow keys ↑(forward) ↓(reverse) ←(left) →(right), 's'(stop), 'q'(quit)")
+    
+    def start_control_thread(self):
+        """Start the keyboard input thread."""
+        if not self.enabled or self.running:
+            return
+        
+        self.running = True
+        self.control_thread = threading.Thread(target=self._keyboard_handler, daemon=True)
+        self.control_thread.start()
+        logging.info("Manual control thread started")
+    
+    def stop_control_thread(self):
+        """Stop the keyboard input thread."""
+        self.running = False
+        if self.control_thread:
+            self.control_thread.join(timeout=1.0)
+    
+    def _keyboard_handler(self):
+        """Handle keyboard input in a separate thread."""
+        old_settings = None
+        try:
+            # Save terminal settings for Linux/Raspberry Pi
+            if sys.platform != 'win32':
+                try:
+                    old_settings = termios.tcgetattr(sys.stdin)
+                    tty.setraw(sys.stdin.fileno())
+                except Exception as e:
+                    logging.warning(f"Could not set raw terminal mode: {e}")
+            
+            logging.info("Manual control active - use arrow keys to control the bike")
+            logging.info("Arrow Keys: ↑(forward) ↓(reverse) ←(left) →(right), 's'(stop), 'q'(quit)")
+            
+            while self.running:
+                if sys.platform == 'win32':
+                    # Windows keyboard handling
+                    import msvcrt
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch()
+                        if key == b'\xe0':  # Special key prefix
+                            key = msvcrt.getch()
+                            self._handle_special_key(key)
+                        else:
+                            self._handle_regular_key(key.decode('utf-8', errors='ignore'))
+                else:
+                    # Linux/Raspberry Pi keyboard handling
+                    if select.select([sys.stdin], [], [], 0.05)[0]:  # Reduced timeout for better responsiveness
+                        key = sys.stdin.read(1)
+                        if key == '\x1b':  # ESC sequence (arrow keys)
+                            # Read the rest of the escape sequence
+                            if select.select([sys.stdin], [], [], 0.05)[0]:
+                                key += sys.stdin.read(1)
+                                if key == '\x1b[':
+                                    if select.select([sys.stdin], [], [], 0.05)[0]:
+                                        key += sys.stdin.read(1)
+                                        self._handle_arrow_key(key)
+                        else:
+                            self._handle_regular_key(key)
+                
+                time.sleep(0.02)  # 50 Hz update rate for better responsiveness
+        
+        except Exception as e:
+            logging.error(f"Keyboard handler error: {e}")
+        finally:
+            # Restore terminal settings on Linux/Raspberry Pi
+            if sys.platform != 'win32' and old_settings is not None:
+                try:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                    logging.info("Terminal settings restored")
+                except Exception as e:
+                    logging.warning(f"Could not restore terminal settings: {e}")
+    
+    def _handle_special_key(self, key):
+        """Handle Windows special keys (arrow keys)."""
+        if key == b'H':  # Up arrow
+            self._press_key('up')
+        elif key == b'P':  # Down arrow
+            self._press_key('down')
+        elif key == b'K':  # Left arrow
+            self._press_key('left')
+        elif key == b'M':  # Right arrow
+            self._press_key('right')
+    
+    def _handle_arrow_key(self, key_seq):
+        """Handle Unix arrow key sequences."""
+        if key_seq == '\x1b[A':  # Up arrow
+            self._press_key('up')
+        elif key_seq == '\x1b[B':  # Down arrow
+            self._press_key('down')
+        elif key_seq == '\x1b[D':  # Left arrow
+            self._press_key('left')
+        elif key_seq == '\x1b[C':  # Right arrow
+            self._press_key('right')
+    
+    def _handle_regular_key(self, key):
+        """Handle regular keys."""
+        if key.lower() == 's':
+            self._press_key('stop')
+        elif key.lower() == 'q':
+            self._press_key('quit')
+            self.running = False
+    
+    def _press_key(self, key):
+        """Handle key press events."""
+        if key == 'up':
+            self.current_pwm = min(self.max_pwm, self.current_pwm + self.pwm_step)
+            logging.info(f"Manual: Forward PWM: {self.current_pwm}")
+        elif key == 'down':
+            self.current_pwm = max(-self.max_pwm, self.current_pwm - self.pwm_step)
+            logging.info(f"Manual: Reverse PWM: {self.current_pwm}")
+        elif key == 'left':
+            self.current_angle = max(-self.max_angle, self.current_angle - self.angle_step)
+            logging.info(f"Manual: Left angle: {self.current_angle:.1f}°")
+        elif key == 'right':
+            self.current_angle = min(self.max_angle, self.current_angle + self.angle_step)
+            logging.info(f"Manual: Right angle: {self.current_angle:.1f}°")
+        elif key == 'stop':
+            self.current_pwm = 0
+            self.current_angle = 0.0
+            logging.info("Manual: STOP - PWM: 0, Angle: 0°")
+        elif key == 'quit':
+            logging.info("Manual: Quit requested")
+    
+    def get_control_values(self):
+        """Get current manual control values."""
+        if not self.enabled:
+            return None, None
+        return self.current_angle, self.current_pwm
+    
+    def should_quit(self):
+        """Check if quit was requested."""
+        return not self.running and self.enabled
 
 class ObstacleAvoidanceState(Enum):
     NORMAL = "normal"
@@ -376,6 +548,9 @@ def run_pair(args):
     # Initialize obstacle avoidance controller
     obstacle_controller = ObstacleAvoidanceController(args)
     
+    # Initialize manual control
+    manual_control = ManualControlState(args)
+    
     # Initialize Arduino communication if requested
     arduino = None
     if args.arduino and ARDUINO_AVAILABLE:
@@ -431,6 +606,10 @@ def run_pair(args):
         logging.info("Live display enabled - BEV and Combined Camera windows will appear when processing starts")
         logging.info("Controls: Press 'q' in any window to quit")
 
+    # Start manual control thread if enabled
+    if manual_control.enabled:
+        manual_control.start_control_thread()
+    
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, ThreadPoolExecutor(max_workers=2) as pool:
         s.connect((args.host, args.port))
         logging.info(f"Connected to server {args.host}:{args.port} (pair mode, max_inflight={args.max_inflight})")
@@ -572,70 +751,116 @@ def run_pair(args):
                                     text = f"Best Path: {best_path['angle_deg']:.1f}° (score: {best_path['score']:.1f})"
                                     cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                                 
-                                # Check for obstacle avoidance override first
-                                obstacle_override = False
-                                final_arduino_angle = arduino_angle
-                                final_driving_pwm = None
+                                # Check for manual control override first
+                                manual_override = False
+                                manual_angle, manual_pwm = manual_control.get_control_values()
                                 
-                                if obstacle_controller.enabled:
-                                    current_time = time.time()
-                                    should_override, override_angle, override_pwm = obstacle_controller.update(detection_data, arduino, current_time)
+                                if manual_control.enabled and (manual_angle is not None or manual_pwm is not None):
+                                    manual_override = True
+                                    final_arduino_angle = manual_angle if manual_angle is not None else 0.0
+                                    final_driving_pwm = manual_pwm if manual_pwm is not None else 0
                                     
-                                    if should_override:
-                                        obstacle_override = True
-                                        if override_angle is not None:
-                                            final_arduino_angle = override_angle
-                                        if override_pwm is not None:
-                                            final_driving_pwm = override_pwm
+                                    # Add manual control status to display
+                                    y_offset += 25
+                                    control_text = f"MANUAL CONTROL - Angle: {final_arduino_angle:.1f}°, PWM: {final_driving_pwm}"
+                                    cv2.putText(img, control_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                                    y_offset += 25
+                                    cv2.putText(img, "Use arrow keys: ↑↓ for speed, ←→ for steering, 's' to stop", 
+                                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                                
+                                # Check for obstacle avoidance override if not in manual mode
+                                obstacle_override = False
+                                if not manual_override:
+                                    final_arduino_angle = arduino_angle
+                                    final_driving_pwm = None
+                                    
+                                    if obstacle_controller.enabled:
+                                        current_time = time.time()
+                                        should_override, override_angle, override_pwm = obstacle_controller.update(detection_data, arduino, current_time)
                                         
-                                        # Update obstacle controller with current angle
-                                        if final_arduino_angle is not None:
-                                            obstacle_controller.update_current_angle(final_arduino_angle)
-                                        
-                                        # Add obstacle avoidance status to display
-                                        y_offset += 25
-                                        state_text = f"Obstacle Avoidance: {obstacle_controller.state.value.upper()}"
-                                        cv2.putText(img, state_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                                        if should_override:
+                                            obstacle_override = True
+                                            if override_angle is not None:
+                                                final_arduino_angle = override_angle
+                                            if override_pwm is not None:
+                                                final_driving_pwm = override_pwm
+                                            
+                                            # Update obstacle controller with current angle
+                                            if final_arduino_angle is not None:
+                                                obstacle_controller.update_current_angle(final_arduino_angle)
+                                            
+                                            # Add obstacle avoidance status to display
+                                            y_offset += 25
+                                            state_text = f"Obstacle Avoidance: {obstacle_controller.state.value.upper()}"
+                                            cv2.putText(img, state_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
                                 
                                 # Send steering angle to Arduino
                                 if final_arduino_angle is not None and arduino is not None:
                                     try:
                                         success = arduino.set_angle(final_arduino_angle)
                                         if success:
-                                            status = "OBSTACLE AVOIDANCE" if obstacle_override else "NORMAL"
+                                            if manual_override:
+                                                status = "MANUAL CONTROL"
+                                            elif obstacle_override:
+                                                status = "OBSTACLE AVOIDANCE"
+                                            else:
+                                                status = "NORMAL"
                                             logging.info(f"Arduino: Set steering angle to {final_arduino_angle:.1f}° ({status})")
                                         else:
                                             logging.warning(f"Arduino: Failed to set angle {final_arduino_angle:.1f}°")
                                     except Exception as e:
                                         logging.error(f"Arduino communication error: {e}")
                                 elif final_arduino_angle is not None:
-                                    status = "OBSTACLE AVOIDANCE" if obstacle_override else "NORMAL"
+                                    if manual_override:
+                                        status = "MANUAL CONTROL"
+                                    elif obstacle_override:
+                                        status = "OBSTACLE AVOIDANCE"
+                                    else:
+                                        status = "NORMAL"
                                     logging.info(f"Would set Arduino angle to {final_arduino_angle:.1f}° ({status}) (Arduino not connected)")
                                 
                                 # Calculate and send driving speed
-                                if args.enable_driving and arduino is not None:
+                                if (args.enable_driving or manual_control.enabled) and arduino is not None:
                                     try:
-                                        if obstacle_override and final_driving_pwm is not None:
+                                        if manual_override and final_driving_pwm is not None:
                                             driving_pwm = final_driving_pwm
-                                        else:
+                                        elif obstacle_override and final_driving_pwm is not None:
+                                            driving_pwm = final_driving_pwm
+                                        elif args.enable_driving:
                                             driving_pwm = calculate_driving_speed(detection_data, args, obstacle_controller)
+                                        else:
+                                            driving_pwm = 0  # Default to stopped if no driving mode enabled
                                         
                                         # Handle reverse PWM (negative values)
-                                        if driving_pwm < 0:
-                                            # For reverse, we might need to use a different Arduino command
-                                            # For now, we'll use absolute value and log the reverse intent
-                                            abs_pwm = abs(driving_pwm)
-                                            success = arduino.set_motor2_pwm(abs_pwm)  # Use absolute value for now
-                                            if success:
-                                                logging.info(f"Arduino: Set REVERSE driving speed to PWM {abs_pwm} (original: {driving_pwm})")
+                                        # Handle PWM commands with safety checks
+                                        try:
+                                            if driving_pwm < 0:
+                                                # For reverse, we might need to use a different Arduino command
+                                                # For now, we'll use absolute value and log the reverse intent
+                                                abs_pwm = abs(driving_pwm)
+                                                success = arduino.set_motor2_pwm(abs_pwm)  # Use absolute value for now
+                                                if success:
+                                                    mode_text = "MANUAL REVERSE" if manual_override else "REVERSE"
+                                                    logging.info(f"Arduino: Set {mode_text} driving speed to PWM {abs_pwm} (original: {driving_pwm})")
+                                                else:
+                                                    logging.warning(f"Arduino: Failed to set reverse driving speed {abs_pwm}")
                                             else:
-                                                logging.warning(f"Arduino: Failed to set reverse driving speed {abs_pwm}")
-                                        else:
-                                            success = arduino.set_motor2_pwm(driving_pwm)
-                                            if success:
-                                                logging.info(f"Arduino: Set driving speed to PWM {driving_pwm}")
-                                            else:
-                                                logging.warning(f"Arduino: Failed to set driving speed {driving_pwm}")
+                                                success = arduino.set_motor2_pwm(driving_pwm)
+                                                if success:
+                                                    mode_text = "MANUAL" if manual_override else "AUTO"
+                                                    logging.info(f"Arduino: Set {mode_text} driving speed to PWM {driving_pwm}")
+                                                else:
+                                                    logging.warning(f"Arduino: Failed to set driving speed {driving_pwm}")
+                                                    # Emergency stop on failure
+                                                    arduino.set_motor2_pwm(0)
+                                        except Exception as e:
+                                            logging.error(f"Arduino PWM control error: {e}")
+                                            # Emergency stop on exception
+                                            try:
+                                                arduino.set_motor2_pwm(0)
+                                                logging.info("Emergency stop activated")
+                                            except:
+                                                pass
                                         
                                         # Add driving info to display
                                         y_offset += 25
@@ -649,19 +874,31 @@ def run_pair(args):
                                             status_text = "STOPPED"
                                             color = (0, 0, 255)  # Red for stopped
                                         
-                                        mode = "OBSTACLE" if obstacle_override else "NORMAL"
+                                        if manual_override:
+                                            mode = "MANUAL"
+                                        elif obstacle_override:
+                                            mode = "OBSTACLE"
+                                        else:
+                                            mode = "NORMAL"
                                         text = f"Driving: {status_text} (PWM: {abs(driving_pwm)}) [{mode}]"
                                         cv2.putText(img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                                         
                                     except Exception as e:
                                         logging.error(f"Arduino driving control error: {e}")
-                                elif args.enable_driving:
-                                    if obstacle_override and final_driving_pwm is not None:
+                                elif args.enable_driving or manual_control.enabled:
+                                    if manual_override and final_driving_pwm is not None:
                                         driving_pwm = final_driving_pwm
-                                    else:
+                                        mode = "MANUAL"
+                                    elif obstacle_override and final_driving_pwm is not None:
+                                        driving_pwm = final_driving_pwm
+                                        mode = "OBSTACLE"
+                                    elif args.enable_driving:
                                         driving_pwm = calculate_driving_speed(detection_data, args, obstacle_controller)
+                                        mode = "NORMAL"
+                                    else:
+                                        driving_pwm = 0
+                                        mode = "STOPPED"
                                     
-                                    mode = "OBSTACLE" if obstacle_override else "NORMAL"
                                     logging.info(f"Would set Arduino driving speed to PWM {driving_pwm} [{mode}] (Arduino not connected)")
                                 
                             except Exception as e:
@@ -768,7 +1005,22 @@ def run_pair(args):
         t_s = threading.Thread(target=sender, daemon=True)
         t_r = threading.Thread(target=receiver, daemon=True)
         t_s.start(); t_r.start()
-        t_s.join(); t_r.join()
+        
+        try:
+            while t_s.is_alive() or t_r.is_alive():
+                # Check if manual control requested quit
+                if manual_control.should_quit():
+                    logging.info("Manual control requested quit - stopping")
+                    break
+                time.sleep(0.1)
+                t_s.join(timeout=0.1)
+                t_r.join(timeout=0.1)
+        except KeyboardInterrupt:
+            logging.info("Keyboard interrupt received - stopping")
+        
+        # Stop manual control thread
+        if manual_control.enabled:
+            manual_control.stop_control_thread()
 
     cap1.release(); cap2.release()
     if wri1: wri1.release()
@@ -930,6 +1182,18 @@ def parse_args():
                    help="Scanning speed in degrees per second (default: 30.0)")
     ap.add_argument("--obstacle-path-weight", type=float, default=0.7,
                    help="Weight coefficient for collision-free path score vs road score (default: 0.7)")
+    
+    # Manual control parameters
+    ap.add_argument("--enable-manual-control", action="store_true",
+                   help="Enable manual keyboard control (arrow keys: ↑=forward, ↓=reverse, ←=left, →=right, s=stop, q=quit)")
+    ap.add_argument("--manual-max-angle", type=float, default=90.0,
+                   help="Maximum steering angle for manual control in degrees (default: 90.0)")
+    ap.add_argument("--manual-angle-step", type=float, default=5.0,
+                   help="Steering angle increment per key press in degrees (default: 5.0)")
+    ap.add_argument("--manual-max-pwm", type=int, default=120,
+                   help="Maximum PWM for manual driving control (default: 120)")
+    ap.add_argument("--manual-pwm-step", type=int, default=10,
+                   help="PWM increment per key press (default: 10)")
     
     return ap.parse_args()
 
