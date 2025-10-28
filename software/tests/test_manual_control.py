@@ -49,15 +49,11 @@ class TestManualControl:
         elif self.arduino_enabled and not ARDUINO_AVAILABLE:
             logging.error("Arduino communication requested but arducom module not available")
         
-        # Key codes for different platforms
-        self.key_codes = {
-            'up': [2490368, 82, 0],      # Up arrow (different platforms/OpenCV versions)
-            'down': [2621440, 84, 1],    # Down arrow
-            'left': [2424832, 81, 2],    # Left arrow  
-            'right': [2555904, 83, 3],   # Right arrow
-            'stop': [ord('s'), ord('S')], # S key
-            'quit': [ord('q'), ord('Q'), 27]  # Q key and ESC
-        }
+        # Use WASD keys which are more reliable than arrow keys in OpenCV
+        self.use_wasd = True
+        print("Using WASD controls for better compatibility:")
+        print("  W = Forward, S = Reverse, A = Left, D = Right")
+        print("  Space = Stop, Q/ESC = Quit")
     
     def _setup_arduino(self):
         """Setup Arduino connection."""
@@ -145,14 +141,15 @@ class TestManualControl:
             print("   Running in simulation mode only")
         
         print("\nControls (focus on the CV2 window):")
-        print("  ↑ (Up Arrow)    - Increase forward speed")
-        print("  ↓ (Down Arrow)  - Increase reverse speed")
-        print("  ← (Left Arrow)  - Turn left")
-        print("  → (Right Arrow) - Turn right")
-        print("  s               - Stop (reset to 0)")
-        print("  q/ESC           - Quit")
+        print("  W - Increase forward speed")
+        print("  S - Increase reverse speed")  
+        print("  A - Turn left")
+        print("  D - Turn right")
+        print("  SPACE - Emergency stop (reset to 0)")
+        print("  Q/ESC - Quit")
         print(f"\nSettings: Max Angle=±{self.max_angle}°, Max PWM=±{self.max_pwm}")
-        print("A control window will open. Click on it and use arrow keys.")
+        print("A control window will open. Click on it to focus, then use WASD keys.")
+        print("Key presses will be shown in console for debugging.")
         print("Current values will be displayed in the window and console.\n")
         
         self._cv2_handler()
@@ -174,15 +171,12 @@ class TestManualControl:
                 # Show the image
                 cv2.imshow(window_name, img)
                 
-                # Wait for key press (1ms timeout for responsiveness)
-                key = cv2.waitKey(1) & 0xFF
+                # Wait for key press (30ms timeout for better key detection)
+                key = cv2.waitKey(30) & 0xFF
                 
                 # Process the key
                 if self._process_key(key):
                     break
-                    
-                # Small delay for CPU
-                time.sleep(0.01)
         
         except Exception as e:
             print(f"CV2 handler error: {e}")
@@ -255,10 +249,11 @@ class TestManualControl:
         cv2.putText(img, arduino_text, (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, arduino_color, 2)
         
         # Controls instructions
-        y_start = 320
-        cv2.putText(img, "Controls:", (50, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(img, "↑↓ = Speed   ←→ = Steering", (50, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(img, "S = Stop     Q/ESC = Quit", (50, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        y_start = 330
+        cv2.putText(img, "Controls (WASD):", (50, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(img, "W=Forward S=Reverse A=Left D=Right", (50, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(img, "SPACE=Stop   Q/ESC=Quit", (50, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(img, "Key presses shown in console", (50, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
         
         return img
     
@@ -266,24 +261,42 @@ class TestManualControl:
         """Process a key from cv2.waitKey(). Returns True if quit was requested."""
         if key == 255 or key == -1:  # No key pressed
             return False
+        
+        # Show what key was pressed for debugging
+        if 32 <= key <= 126:  # Printable ASCII
+            key_char = chr(key)
+            print(f"Key pressed: '{key_char}' (code: {key})")
+        else:
+            print(f"Special key pressed: {key} (0x{key:X})")
             
-        # Handle different key codes for arrow keys
-        if key in self.key_codes['up']:
+        # Use simple character-based controls (more reliable than arrow keys)
+        key_char = key if key < 127 else 0
+        
+        if key_char == ord('w') or key_char == ord('W'):
             self._press_key('up')
-        elif key in self.key_codes['down']:
+        elif key_char == ord('s') or key_char == ord('S'):
             self._press_key('down')
-        elif key in self.key_codes['left']:
+        elif key_char == ord('a') or key_char == ord('A'):
             self._press_key('left')
-        elif key in self.key_codes['right']:
+        elif key_char == ord('d') or key_char == ord('D'):
             self._press_key('right')
-        elif key in self.key_codes['stop']:
+        elif key_char == ord(' ') or key_char == 32:  # Spacebar
             self._press_key('stop')
-        elif key in self.key_codes['quit']:
+        elif key_char == ord('q') or key_char == ord('Q') or key == 27:  # ESC
             self._press_key('quit')
             return True
         else:
-            # Debug: print unknown key codes to help with platform differences
-            print(f"Debug: Key code {key} pressed")
+            # Try arrow keys with common codes
+            if key == 2490368 or key == 82:  # Up arrow
+                self._press_key('up')
+            elif key == 2621440 or key == 84:  # Down arrow
+                self._press_key('down')
+            elif key == 2424832 or key == 81:  # Left arrow
+                self._press_key('left')
+            elif key == 2555904 or key == 83:  # Right arrow
+                self._press_key('right')
+            else:
+                print(f"Unknown key. Use: W=forward, S=reverse, A=left, D=right, Space=stop, Q=quit")
         
         return False
     
