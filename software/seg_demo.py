@@ -22,7 +22,7 @@ JPEG_QUALITY = 40
 IN_QUEUE_MAX = 1                  # per-worker queue
 OUT_QUEUE_MAX = 4                # shared out queue (results)
 PAIR_QUEUE_MAX = 4                # decoded frames waiting to be dispatched
-MAX_INFLIGHT = 6                 # “window” of pairs/singles dispatched but not yet replied
+MAX_INFLIGHT = 1                 # “window” of pairs/singles dispatched but not yet replied
 
 LOG_EVERY_N_FRAMES = 20
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
